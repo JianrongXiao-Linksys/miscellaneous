@@ -8,6 +8,7 @@ A collection of utility scripts and tools for network device management, monitor
 - [Tools](#tools)
   - [WiFi Client Monitor](#wifi-client-monitor)
   - [Register Dump (5GHz Radio Debug)](#register-dump-5ghz-radio-debug)
+  - [Strip Sensitive Data](#strip-sensitive-data)
 - [Installation](#installation)
 - [Requirements](#requirements)
 - [Contributing](#contributing)
@@ -34,6 +35,7 @@ Each tool is documented with its purpose, usage instructions, and technical deta
 |------|--------|-------------|
 | [WiFi Client Monitor](#wifi-client-monitor) | [`monitor_wifi_clients.sh`](scripts/monitor_wifi_clients.sh) | Monitor client associations on wireless interface |
 | [Register Dump](#register-dump-5ghz-radio-debug) | [`Reg_dump.sh`](scripts/Reg_dump.sh) | Capture MAC/PHY registers for 5GHz radio debugging |
+| [Strip Sensitive Data](#strip-sensitive-data) | [`strip-sensitive.py`](scripts/strip-sensitive.py) | Remove PII/secrets from code/logs before sharing with LLMs |
 
 ---
 
@@ -372,6 +374,140 @@ Collection 2 - Timestamp: ...
 
 ---
 
+### Strip Sensitive Data
+
+**Script:** `scripts/strip-sensitive.py`
+
+**Purpose:** Sanitizes code, logs, and text files by removing PII and secrets before sharing with external LLMs or posting publicly.
+
+#### Description
+
+This Python script automatically detects and redacts sensitive information from text content, making it safe to share code snippets, log files, or configuration data with external AI assistants, support forums, or documentation.
+
+#### Features
+
+- **API Keys & Tokens**: AWS keys, GitHub tokens, Slack tokens, generic API keys
+- **Credentials**: Passwords, secrets, private keys, certificates
+- **Personal Data**: Email addresses, phone numbers, SSNs, credit card numbers
+- **Network Data**: IP addresses (distinguishes private/internal vs public), MAC addresses
+- **System Data**: User paths (`/Users/username`, `C:\Users\username`), internal hostnames
+- **Project Names**: Configurable list of proprietary names to redact (Linksys, Velop, etc.)
+- **Custom Keywords**: Add your own sensitive terms via config file or CLI
+
+#### Technical Details
+
+| Aspect | Details |
+|--------|---------|
+| **Language** | Python 3.6+ |
+| **Dependencies** | None (standard library only) |
+| **Input** | File, stdin, or piped input |
+| **Output** | File, stdout |
+| **Config** | Optional JSON configuration file |
+
+#### Usage
+
+**Basic usage:**
+
+```bash
+# From file to file
+./strip-sensitive.py input.log output.log
+
+# From stdin (use '-' for stdin)
+cat server.log | ./strip-sensitive.py - > clean.log
+
+# Pipe directly
+./strip-sensitive.py input.txt | pbcopy  # Copy to clipboard (macOS)
+```
+
+**With options:**
+
+```bash
+# Verbose mode (show redaction statistics)
+./strip-sensitive.py input.log -o output.log -v
+
+# Dry run (see what would be redacted without changing)
+./strip-sensitive.py input.log --dry-run
+
+# Add custom project names to redact
+./strip-sensitive.py input.log --add-project "SecretProject" --add-project "InternalTool"
+
+# Add custom keywords
+./strip-sensitive.py input.log --add-keyword "confidential" --add-keyword "internal-api"
+
+# Use custom config file
+./strip-sensitive.py input.log -c my_config.json
+```
+
+#### Configuration
+
+Create a JSON config file for persistent settings:
+
+```json
+{
+  "project_names": [
+    "linksys",
+    "velop",
+    "your-company-name"
+  ],
+  "custom_keywords": [
+    "internal-service",
+    "secret-project"
+  ],
+  "placeholders": {
+    "email": "[EMAIL_REDACTED]",
+    "ip_private": "[INTERNAL_IP]",
+    "api_key": "[API_KEY_REDACTED]"
+  }
+}
+```
+
+See `scripts/strip-sensitive-config.example.json` for full configuration options.
+
+#### Example
+
+**Input:**
+```
+User john@company.com connected from 192.168.1.100
+MAC: 00:1A:2B:3C:4D:5E
+API_KEY=sk_live_abc123def456ghi789
+Linksys device at 10.0.0.1
+Path: /Users/jianrongxiao/Desktop/project
+```
+
+**Output:**
+```
+User [EMAIL_REDACTED] connected from [INTERNAL_IP]
+MAC: [MAC_REDACTED]
+[API_KEY_REDACTED]
+[PROJECT_REDACTED] device at [INTERNAL_IP]
+Path: /Users/[USER_REDACTED]/Desktop/project
+```
+
+#### Detected Patterns
+
+| Category | Examples |
+|----------|----------|
+| **API Keys** | `AKIA...`, `ghp_...`, `xoxb-...`, `sk_live_...` |
+| **Passwords** | `password=xxx`, `pwd: xxx`, `passwd=xxx` |
+| **Emails** | `user@domain.com` |
+| **Phone Numbers** | `555-123-4567`, `+1 (555) 123-4567` |
+| **IP Addresses** | `192.168.x.x` (private), `8.8.8.8` (public) |
+| **MAC Addresses** | `00:1A:2B:3C:4D:5E` |
+| **SSN** | `123-45-6789` |
+| **Credit Cards** | Visa, Mastercard, Amex patterns |
+| **Private Keys** | `-----BEGIN PRIVATE KEY-----` |
+| **User Paths** | `/Users/name/...`, `C:\Users\name\...` |
+
+#### Use Cases
+
+1. **Sharing logs with external LLMs**: Sanitize before pasting into ChatGPT, Claude, etc.
+2. **Bug reports**: Clean sensitive data before posting to GitHub issues
+3. **Documentation**: Redact real values when creating examples
+4. **Code review**: Share code snippets without exposing credentials
+5. **Support tickets**: Clean logs before sending to vendors
+
+---
+
 ## Installation
 
 ### Clone the Repository
@@ -414,10 +550,12 @@ scp -r scripts/* root@<router-ip>:/tmp/tools/
 
 ```
 miscellaneous/
-├── README.md                       # This file
+├── README.md                              # This file
 ├── scripts/
-│   ├── monitor_wifi_clients.sh    # WiFi client monitoring script
-│   └── Reg_dump.sh                # 5GHz radio register dump diagnostic
+│   ├── monitor_wifi_clients.sh            # WiFi client monitoring script
+│   ├── Reg_dump.sh                        # 5GHz radio register dump diagnostic
+│   ├── strip-sensitive.py                 # PII/secrets stripping tool
+│   └── strip-sensitive-config.example.json # Example config for strip-sensitive
 └── (future tools...)
 ```
 
