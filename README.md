@@ -36,6 +36,8 @@ Each tool is documented with its purpose, usage instructions, and technical deta
 
 **Purpose:** Monitors WiFi client associations on a wireless interface and logs state changes (clients connecting/disconnecting) to a file.
 
+**Related Issue:** [linksys/LinksysWRT#46](https://github.com/linksys/LinksysWRT/issues/46) - After 7 days 5GHz stopped broadcasting, and child nodes disconnected
+
 #### Description
 
 This script continuously monitors the `ath10` wireless interface on Qualcomm/Atheros-based routers and access points. It detects when clients associate or disassociate from the network and creates detailed log entries capturing the full station list at each state transition.
@@ -122,7 +124,7 @@ INTERVAL=30                    # Polling interval in seconds
 INTERFACE="ath0"
 
 # For 6GHz radio (if available)
-INTERFACE="ath20"
+INTERFACE="ath30"
 ```
 
 #### Log Output Format
@@ -302,7 +304,7 @@ ATH_NAME=ath0
 ```bash
 WIFI_INTERFACE=2
 WIFI_NAME=wifi2
-ATH_NAME=ath20
+ATH_NAME=ath30
 ```
 
 #### Output Format
