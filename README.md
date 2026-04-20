@@ -30,6 +30,13 @@ Each tool is documented with its purpose, usage instructions, and technical deta
 
 ## Tools
 
+| Tool | Script | Description |
+|------|--------|-------------|
+| [WiFi Client Monitor](#wifi-client-monitor) | [`monitor_wifi_clients.sh`](scripts/monitor_wifi_clients.sh) | Monitor client associations on wireless interface |
+| [Register Dump](#register-dump-5ghz-radio-debug) | [`Reg_dump.sh`](scripts/Reg_dump.sh) | Capture MAC/PHY registers for 5GHz radio debugging |
+
+---
+
 ### WiFi Client Monitor
 
 **Script:** `scripts/monitor_wifi_clients.sh`
