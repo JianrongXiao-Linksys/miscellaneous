@@ -1,0 +1,30 @@
+{
+  "project_names": [
+    "linksys",
+    "velop",
+    "cognio",
+    "wrt",
+    "your-company-name"
+  ],
+  "custom_keywords": [
+    "internal-service",
+    "secret-project"
+  ],
+  "placeholders": {
+    "email": "[EMAIL_REDACTED]",
+    "phone": "[PHONE_REDACTED]",
+    "ip_private": "[INTERNAL_IP]",
+    "ip_public": "[IP_REDACTED]",
+    "mac": "[MAC_REDACTED]",
+    "api_key": "[API_KEY_REDACTED]",
+    "password": "[PASSWORD_REDACTED]",
+    "token": "[TOKEN_REDACTED]",
+    "secret": "[SECRET_REDACTED]",
+    "ssn": "[SSN_REDACTED]",
+    "credit_card": "[CC_REDACTED]",
+    "project": "[PROJECT_REDACTED]",
+    "hostname": "[HOSTNAME_REDACTED]",
+    "username": "[USER_REDACTED]",
+    "path": "[PATH_REDACTED]"
+  }
+}
