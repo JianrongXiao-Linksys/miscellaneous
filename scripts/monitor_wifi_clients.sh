@@ -57,9 +57,21 @@ while true; do
             cnsscli -i qcn6432_pci0 --qdss_start 2>&1 | tee -a "$LOG_FILE"
             cnsscli -i qcn6432_pci0 --qdss_stop 0x1 2>&1 | tee -a "$LOG_FILE"
 
-            # 3. Copy trace file
-            echo "Copying trace file to /tmp/..." | tee -a "$LOG_FILE"
-            cp /data/vendor/wifi/cHwTrc0_QCN6432_1.bin /tmp/ 2>&1 | tee -a "$LOG_FILE"
+            # 3. Upload trace file to lab server via scp (dropbear key-based auth)
+            TRACE_FILE="/data/vendor/wifi/cHwTrc0_QCN6432_1.bin"
+            REMOTE_HOST="192.168.5.85"
+            REMOTE_USER="linksys"
+            REMOTE_DIR="/home/linksys"
+            TIMESTAMP=$(date '+%Y%m%d_%H%M%S')
+            REMOTE_FILENAME="cHwTrc0_QCN6432_1_${TIMESTAMP}.bin"
+            echo "Uploading trace file to ${REMOTE_USER}@${REMOTE_HOST}:${REMOTE_DIR}/${REMOTE_FILENAME}..." | tee -a "$LOG_FILE"
+            scp -o StrictHostKeyChecking=no -i /root/.ssh/id_dropbear "$TRACE_FILE" "${REMOTE_USER}@${REMOTE_HOST}:${REMOTE_DIR}/${REMOTE_FILENAME}" 2>&1 | tee -a "$LOG_FILE"
+            if [ $? -eq 0 ]; then
+                echo "Upload successful" | tee -a "$LOG_FILE"
+            else
+                echo "SCP upload failed, falling back to local copy" | tee -a "$LOG_FILE"
+                cp "$TRACE_FILE" /tmp/ 2>&1 | tee -a "$LOG_FILE"
+            fi
 
             # 4. Second QDSS trace and trigger FW recovery
             echo "Starting second QDSS trace and triggering FW recovery..." | tee -a "$LOG_FILE"
