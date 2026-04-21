@@ -58,6 +58,10 @@ This script continuously monitors the `ath10` wireless interface on Qualcomm/Ath
 - Timestamped log entries with full `wlanconfig` output
 - Lightweight shell script compatible with BusyBox environments
 - Console feedback for monitoring status
+- Automated QDSS trace capture and upload to lab server via SCP on client disassociation
+- Dropbear SSH key-based authentication (no password required after setup)
+- Timestamped remote filenames to preserve multiple trace captures
+- Fallback to local `/tmp/` copy if SCP upload fails
 
 #### Technical Details
 
@@ -69,6 +73,8 @@ This script continuously monitors the `ath10` wireless interface on Qualcomm/Ath
 | **Log Location** | `/tmp/clients.log` |
 | **Default Interface** | `ath10` (5GHz radio) |
 | **Polling Interval** | 30 seconds |
+| **Trace Upload** | SCP to `linksys@192.168.5.85:/home/linksys/` |
+| **SSH Auth** | Dropbear key at `/root/.ssh/id_dropbear` |
 
 #### How It Works
 
@@ -77,7 +83,29 @@ This script continuously monitors the `ath10` wireless interface on Qualcomm/Ath
 3. **Parsing**: Counts lines matching MAC address patterns (format: `xx:xx:xx:xx:xx:xx`)
 4. **State Comparison**: Compares current client count with previous state
 5. **Logging**: On state change, logs full station output with timestamp
-6. **Loop**: Sleeps for the configured interval and repeats
+6. **Diagnostic Collection** (on client disassociation):
+   - Runs `wifistats_regdump.sh` for register dumps
+   - Captures first QDSS trace via `cnsscli`
+   - Uploads trace file to lab server via SCP (timestamped filename)
+   - Captures second QDSS trace and triggers FW recovery
+7. **Loop**: Sleeps for the configured interval and repeats
+
+#### SSH Key Setup (One-Time)
+
+Before the script can upload trace files, set up dropbear key-based auth on the router:
+
+```bash
+# Generate a dropbear RSA key
+dropbearkey -t rsa -f /root/.ssh/id_dropbear
+
+# Extract the public key
+dropbearkey -y -f /root/.ssh/id_dropbear | grep "^ssh-rsa" > /tmp/id_dropbear.pub
+
+# Copy it to the lab server (enter password once: LinksysLab123!)
+ssh linksys@192.168.5.85 "mkdir -p ~/.ssh && cat >> ~/.ssh/authorized_keys" < /tmp/id_dropbear.pub
+```
+
+After this setup, all SCP uploads from the script will be passwordless.
 
 #### Usage
 
@@ -124,6 +152,14 @@ You can modify these variables at the top of the script:
 LOG_FILE="/tmp/clients.log"    # Output log file path
 INTERFACE="ath10"              # Wireless interface to monitor
 INTERVAL=30                    # Polling interval in seconds
+```
+
+The trace upload destination is configured in the diagnostic section:
+
+```bash
+REMOTE_HOST="192.168.5.85"    # Lab server IP
+REMOTE_USER="linksys"         # SSH username
+REMOTE_DIR="/home/linksys"    # Remote destination directory
 ```
 
 **To monitor a different interface:**
@@ -552,7 +588,8 @@ scp -r scripts/* root@<router-ip>:/tmp/tools/
 miscellaneous/
 ├── README.md                              # This file
 ├── scripts/
-│   ├── monitor_wifi_clients.sh            # WiFi client monitoring script
+│   ├── monitor_wifi_clients.sh            # WiFi client monitoring + QDSS trace upload
+│   ├── wifistats_regdump.sh              # WiFi stats and register dump collection
 │   ├── Reg_dump.sh                        # 5GHz radio register dump diagnostic
 │   ├── strip-sensitive.py                 # PII/secrets stripping tool
 │   └── strip-sensitive-config.example.json # Example config for strip-sensitive
