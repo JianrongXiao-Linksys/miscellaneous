@@ -10,6 +10,7 @@ A collection of utility scripts and tools for network device management, monitor
   - [Register Dump (5GHz Radio Debug)](#register-dump-5ghz-radio-debug)
   - [Strip Sensitive Data](#strip-sensitive-data)
   - [CVE-2021-27137 miniupnpd Exploit Test](#cve-2021-27137-miniupnpd-exploit-test)
+  - [CVE-2026 dnsmasq Vulnerability Tester](#cve-2026-dnsmasq-vulnerability-tester)
 - [Installation](#installation)
 - [Requirements](#requirements)
 - [Contributing](#contributing)
@@ -38,6 +39,7 @@ Each tool is documented with its purpose, usage instructions, and technical deta
 | [Register Dump](#register-dump-5ghz-radio-debug) | [`Reg_dump.sh`](scripts/Reg_dump.sh) | Capture MAC/PHY registers for 5GHz radio debugging |
 | [CVE-2021-27137 Exploit Test](#cve-2021-27137-miniupnpd-exploit-test) | [`test_CVE-2021-27137_miniupnpd.sh`](test_CVE-2021-27137_miniupnpd.sh) | On-device exploit test for miniupnpd XML parser buffer overflow |
 | [Strip Sensitive Data](#strip-sensitive-data) | [`strip-sensitive.py`](scripts/strip-sensitive.py) | Remove PII/secrets from code/logs before sharing with LLMs |
+| [CVE-2026 dnsmasq Tester](#cve-2026-dnsmasq-vulnerability-tester) | [`dnsmasq_cve_2026/dnsmasq_cve_tester.py`](dnsmasq_cve_2026/dnsmasq_cve_tester.py) | Network + static analysis test suite for 6 dnsmasq CVEs (May 2026) |
 
 ---
 
@@ -677,6 +679,64 @@ scp -r scripts/* root@<router-ip>:/tmp/tools/
 
 ---
 
+### CVE-2026 dnsmasq Vulnerability Tester
+
+**Script:** `dnsmasq_cve_2026/dnsmasq_cve_tester.py`
+
+**Purpose:** Tests for the 6 dnsmasq vulnerabilities disclosed in May 2026 that threaten broadband routers. Supports network testing (against live dnsmasq instances), static source code analysis, and binary version checking.
+
+**CVEs Covered:**
+
+| CVE | CVSS | Impact | Prerequisite |
+|-----|------|--------|--------------|
+| CVE-2026-2291 | 9.2 (Critical) | Heap overflow in `extract_name()` → RCE/cache poisoning | DNS active (always) |
+| CVE-2026-5172 | 7.5 (High) | OOB read in `extract_addresses()` → crash | DNS active (always) |
+| CVE-2026-4890 | 7.5 (High) | NSEC bitmap infinite loop → complete DoS | `--dnssec` |
+| CVE-2026-4891 | 5.3 (Moderate) | RRSIG heap OOB read → info leak | `--dnssec` |
+| CVE-2026-4892 | 8.4 (High) | DHCPv6 CLID overflow → local root | `--dhcp-script` + DHCPv6 |
+| CVE-2026-4893 | 5.3 (Moderate) | ECS source validation bypass | `--add-subnet` |
+
+**Fix version:** dnsmasq 2.92rel2 (released 2026-05-11)
+
+#### Usage
+
+```bash
+# Static source code analysis (no network needed, safe)
+python3 dnsmasq_cve_2026/dnsmasq_cve_tester.py \
+  --source ~/code/Main_Oak/products/oak/output/release/dnsmasq/build/dnsmasq-2.78 \
+  --source ~/code/pinnacle/develop_46_2.2/store/sdk/qsdk/build_dir/target-arm/dnsmasq-nodhcpv6/dnsmasq-2.90
+
+# Network test against a live dnsmasq instance
+python3 dnsmasq_cve_2026/dnsmasq_cve_tester.py --target 192.168.1.1
+
+# Test a specific CVE only
+python3 dnsmasq_cve_2026/dnsmasq_cve_tester.py --target 192.168.1.1 --test CVE-2026-2291
+
+# Binary version check
+python3 dnsmasq_cve_2026/dnsmasq_cve_tester.py --binary /usr/sbin/dnsmasq
+
+# Full combined analysis
+python3 dnsmasq_cve_2026/dnsmasq_cve_tester.py \
+  --target 192.168.1.1 \
+  --source ~/code/pinnacle/develop_46_2.2/store/sdk/qsdk/build_dir/target-arm/dnsmasq-nodhcpv6/dnsmasq-2.90 \
+  --binary ~/code/Main_Oak/products/oak/nfsroot/release/rootfs/sbin/dnsmasq
+```
+
+#### Requirements
+
+- Python 3.6+ (no external dependencies — uses only `socket`/`struct`)
+- Root/sudo for DHCPv6 tests (CVE-2026-4892)
+- Network access to target for live tests
+
+#### Notes
+
+- **Network tests may crash a vulnerable dnsmasq** — use on test devices only
+- The `nodhcpv6` build variant (pinnacle) is NOT affected by CVE-2026-4892
+- CVE-2026-2291 and CVE-2026-5172 have NO mitigation other than patching
+- See `dnsmasq_cve_2026/README.md` for detailed technical background
+
+---
+
 ## Project Structure
 
 ```
@@ -689,6 +749,9 @@ miscellaneous/
 │   ├── strip-sensitive.py                 # PII/secrets stripping tool
 │   └── strip-sensitive-config.example.json # Example config for strip-sensitive
 ├── test_CVE-2021-27137_miniupnpd.sh     # CVE-2021-27137 on-device exploit test
+├── dnsmasq_cve_2026/                     # CVE-2026 dnsmasq vulnerability test suite
+│   ├── dnsmasq_cve_tester.py            # Main test tool (network + static analysis)
+│   └── README.md                         # Detailed usage documentation
 └── (future tools...)
 ```
 
