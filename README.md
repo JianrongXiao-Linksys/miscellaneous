@@ -9,6 +9,7 @@ A collection of utility scripts and tools for network device management, monitor
   - [WiFi Client Monitor](#wifi-client-monitor)
   - [Register Dump (5GHz Radio Debug)](#register-dump-5ghz-radio-debug)
   - [Strip Sensitive Data](#strip-sensitive-data)
+  - [CVE-2021-27137 miniupnpd Exploit Test](#cve-2021-27137-miniupnpd-exploit-test)
 - [Installation](#installation)
 - [Requirements](#requirements)
 - [Contributing](#contributing)
@@ -35,6 +36,7 @@ Each tool is documented with its purpose, usage instructions, and technical deta
 |------|--------|-------------|
 | [WiFi Client Monitor](#wifi-client-monitor) | [`monitor_wifi_clients.sh`](scripts/monitor_wifi_clients.sh) | Monitor client associations on wireless interface |
 | [Register Dump](#register-dump-5ghz-radio-debug) | [`Reg_dump.sh`](scripts/Reg_dump.sh) | Capture MAC/PHY registers for 5GHz radio debugging |
+| [CVE-2021-27137 Exploit Test](#cve-2021-27137-miniupnpd-exploit-test) | [`test_CVE-2021-27137_miniupnpd.sh`](test_CVE-2021-27137_miniupnpd.sh) | On-device exploit test for miniupnpd XML parser buffer overflow |
 | [Strip Sensitive Data](#strip-sensitive-data) | [`strip-sensitive.py`](scripts/strip-sensitive.py) | Remove PII/secrets from code/logs before sharing with LLMs |
 
 ---
@@ -410,6 +412,99 @@ Collection 2 - Timestamp: ...
 
 ---
 
+
+### CVE-2021-27137 miniupnpd Exploit Test
+
+**Script:** `test_CVE-2021-27137_miniupnpd.sh`
+
+**Purpose:** On-device exploit test to verify that miniupnpd correctly handles truncated XML attributes (buffer read overflow in `minixml.c` `parseatt()` function).
+
+**CVE:** CVE-2021-27137 | **Fix:** [miniupnp/miniupnp@3cfb4fb](https://github.com/miniupnp/miniupnp/commit/3cfb4fb78d5ac04ed0dadc8dd842fc9e448916db)
+
+**Affected:** miniupnpd <= 2.3.3 (includes QSDK 12.5 and 14.0)
+
+#### Description
+
+The vulnerability is a buffer read overflow in `minixml.c` where the `parseatt()` function advances past `=` in XML attributes without bounds checking. Truncated input like `<element attribute=` (no value after `=`) causes out-of-bounds memory reads that can crash the daemon or leak memory contents.
+
+This script sends multiple malformed XML payloads to the device and verifies the daemon stays alive after each one.
+
+#### Technical Details
+
+| Aspect | Details |
+|--------|--------|
+| **Language** | Bash |
+| **Target** | Any device running miniupnpd (OpenWrt, QSDK) |
+| **Protocol** | HTTP POST to UPnP SOAP endpoint |
+| **Dependencies** | `nc` (netcat), `ping`, optional SSH |
+| **Payloads** | 4 variants of truncated/malformed XML attributes |
+
+#### Test Cases
+
+| # | Payload | What It Tests |
+|---|---------|---------------|
+| 1 | `<element attribute=` | Core CVE trigger — truncated after `=` |
+| 2 | `<s xmlns:u="urn:..." u:a=` | Namespaced attribute at buffer boundary |
+| 3 | `<root><child attr1="ok" attr2=` | Nested elements with partial second attr |
+| 4 | `<element verylongattributename` | Attribute name with no `=` (secondary bounds check) |
+| 5 | Valid SOAP GetExternalIPAddress | Regression check — normal UPnP still works |
+
+#### Usage
+
+```bash
+# Basic test
+./test_CVE-2021-27137_miniupnpd.sh 192.168.1.1
+
+# Custom port
+./test_CVE-2021-27137_miniupnpd.sh 192.168.1.1 5000
+```
+
+#### Example Output
+
+```
+==============================================
+ CVE-2021-27137 miniupnpd Exploit Tester
+ Target: 192.168.1.1:5000
+==============================================
+
+[PASS] Device is reachable
+[PASS] Port 5000 is open
+[INFO] miniupnpd PID before tests: 1234
+
+--- Running exploit payloads ---
+
+[INFO] Test 1: Sending truncated attribute payload (core CVE trigger)...
+[PASS] Test 1 (truncated attribute=) — daemon still alive
+[INFO] Test 2: Sending attribute with = at end-of-buffer...
+[PASS] Test 2 (attribute at buffer end) — daemon still alive
+[INFO] Test 3: Sending nested elements with truncated attributes...
+[PASS] Test 3 (nested truncated) — daemon still alive
+[INFO] Test 4: Sending attribute name with no = (hits first boundary)...
+[PASS] Test 4 (no equals sign) — daemon still alive
+
+--- Running regression check ---
+
+[PASS] Normal UPnP request returns valid response
+
+--- Checking post-test daemon state ---
+
+[PASS] Daemon PID unchanged (1234) — no crash/restart
+
+==============================================
+ Results: 7 PASSED, 0 FAILED
+==============================================
+
+PASSED: miniupnpd handled all malformed XML without crashing.
+```
+
+#### Interpreting Results
+
+- **All PASS**: The CVE fix is applied (or the daemon survived by luck — run multiple times)
+- **FAIL on Tests 1-4**: Daemon crashed from malformed XML — **vulnerable**, apply the patch
+- **PID changed**: Daemon crashed but was auto-restarted by procd — still **vulnerable**
+- **Test 5 (regression) fails**: Normal UPnP broken — may indicate incorrect patch application
+
+---
 ### Strip Sensitive Data
 
 **Script:** `scripts/strip-sensitive.py`
@@ -593,6 +688,7 @@ miscellaneous/
 │   ├── Reg_dump.sh                        # 5GHz radio register dump diagnostic
 │   ├── strip-sensitive.py                 # PII/secrets stripping tool
 │   └── strip-sensitive-config.example.json # Example config for strip-sensitive
+├── test_CVE-2021-27137_miniupnpd.sh     # CVE-2021-27137 on-device exploit test
 └── (future tools...)
 ```
 
