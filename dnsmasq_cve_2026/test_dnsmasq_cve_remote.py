@@ -116,26 +116,32 @@ def test_device(target, port=53):
     passes = 0
     fails = 0
 
-    # Check if responding
+    # Step 1: Check if responding
+    print(f"  [1/3] Sending version.bind query to {target}:{port}...")
     if not check_dns_responding(target, port):
-        print(f"  ERROR: No DNS response from {target}:{port}")
+        print(f"        → No response. Device not reachable or dnsmasq not running.")
         return 0, 0, []
+    print(f"        → Device responded.")
 
-    # Get version
+    # Step 2: Get version
+    print(f"  [2/3] Querying dnsmasq version (version.bind CH TXT)...")
     version_str = query_version(target, port)
     version = parse_version(version_str) if version_str else None
 
     if not version_str:
-        print(f"  WARNING: Could not get version (version.bind blocked)")
-        print(f"  Cannot determine vulnerability status without version info.")
+        print(f"        → Could not get version (version.bind may be blocked).")
+        print(f"        Cannot determine vulnerability status.")
         return 0, 0, []
 
     is_patched = version >= FIXED_VERSION if version else False
+    status_label = "\033[92mPATCHED\033[0m" if is_patched else "\033[91mVULNERABLE\033[0m"
+    print(f"        → Got: {version_str}  [{status_label}]")
 
-    print(f"  Version: {version_str}  {'[PATCHED]' if is_patched else '[VULNERABLE]'}")
+    # Step 3: Evaluate CVEs
+    print(f"  [3/3] Checking CVEs against version {version_str}...")
+    print(f"        (fix version: 2.92rel2)")
     print(f"")
 
-    # CVE checks based on version
     cves = [
         ("CVE-2026-2291", "heap overflow in extract_name()", True),
         ("CVE-2026-5172", "OOB read crash in extract_addresses()", True),
