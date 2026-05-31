@@ -706,20 +706,72 @@ python3 dnsmasq_cve_2026/dnsmasq_cve_tester.py \
   --source ~/code/Main_Oak/products/oak/output/release/dnsmasq/build/dnsmasq-2.78 \
   --source ~/code/pinnacle/develop_46_2.2/store/sdk/qsdk/build_dir/target-arm/dnsmasq-nodhcpv6/dnsmasq-2.90
 
-# Network test against a live dnsmasq instance
-python3 dnsmasq_cve_2026/dnsmasq_cve_tester.py --target 192.168.1.1
-
-# Test a specific CVE only
-python3 dnsmasq_cve_2026/dnsmasq_cve_tester.py --target 192.168.1.1 --test CVE-2026-2291
-
 # Binary version check
 python3 dnsmasq_cve_2026/dnsmasq_cve_tester.py --binary /usr/sbin/dnsmasq
+```
 
-# Full combined analysis
-python3 dnsmasq_cve_2026/dnsmasq_cve_tester.py \
-  --target 192.168.1.1 \
-  --source ~/code/pinnacle/develop_46_2.2/store/sdk/qsdk/build_dir/target-arm/dnsmasq-nodhcpv6/dnsmasq-2.90 \
-  --binary ~/code/Main_Oak/products/oak/nfsroot/release/rootfs/sbin/dnsmasq
+#### Replicate Against a Live Device (QA Test Procedure)
+
+**Prerequisites:**
+- DUT (Device Under Test) running unpatched firmware on 192.168.1.1 (adjust IP as needed)
+- Test host on the same LAN with Python 3.6+
+- SSH/serial access to DUT for crash monitoring
+
+**Step 1:** On the DUT, open a serial/SSH session and monitor for crashes:
+```bash
+logread -f &
+while true; do pidof dnsmasq > /dev/null || echo "*** DNSMASQ CRASHED at $(date) ***"; sleep 1; done
+```
+
+**Step 2:** From the test host, run all 6 CVE tests:
+```bash
+# Test ALL 6 CVEs at once
+python3 dnsmasq_cve_2026/dnsmasq_cve_tester.py --target 192.168.1.1
+
+# Or test each CVE individually:
+python3 dnsmasq_cve_2026/dnsmasq_cve_tester.py --target 192.168.1.1 --test CVE-2026-2291
+python3 dnsmasq_cve_2026/dnsmasq_cve_tester.py --target 192.168.1.1 --test CVE-2026-5172
+python3 dnsmasq_cve_2026/dnsmasq_cve_tester.py --target 192.168.1.1 --test CVE-2026-4890
+python3 dnsmasq_cve_2026/dnsmasq_cve_tester.py --target 192.168.1.1 --test CVE-2026-4891
+python3 dnsmasq_cve_2026/dnsmasq_cve_tester.py --target 192.168.1.1 --test CVE-2026-4892
+python3 dnsmasq_cve_2026/dnsmasq_cve_tester.py --target 192.168.1.1 --test CVE-2026-4893
+```
+
+**Step 3:** Observe results on DUT serial/SSH:
+
+| CVE | What to look for on DUT | Vulnerable if... |
+|-----|------------------------|-----------------|
+| CVE-2026-2291 | `pidof dnsmasq` returns empty | dnsmasq process crashes (segfault) |
+| CVE-2026-5172 | `pidof dnsmasq` returns empty | dnsmasq process crashes (segfault) |
+| CVE-2026-4890 | `top` shows dnsmasq at 100% CPU, DNS queries get no response | dnsmasq hangs in infinite loop (not a crash) |
+| CVE-2026-4891 | `dmesg` shows segfault or dnsmasq stops responding | dnsmasq crashes or leaks memory |
+| CVE-2026-4892 | `dmesg \| grep segfault` shows helper crash | dnsmasq helper process crashes (runs as root) |
+| CVE-2026-4893 | Tool reports ECS option echoed without validation | Cache accepts spoofed subnet (no crash) |
+
+**Step 4:** After applying patches, reflash and repeat. All tests should show the device surviving.
+
+#### Platform Applicability
+
+| CVE | Oak (dnsmasq 2.78) | Pinnacle nodhcpv6 (2.90) | Notes |
+|-----|-------------------|--------------------------|-------|
+| CVE-2026-2291 | **YES — test it** | **YES — test it** | Always reachable via DNS |
+| CVE-2026-5172 | **YES — test it** | **YES — test it** | Always reachable via DNS |
+| CVE-2026-4890 | No (DNSSEC off) | Only if `full` variant | Needs `--dnssec` enabled |
+| CVE-2026-4891 | No (DNSSEC off) | Only if `full` variant | Needs `--dnssec` enabled |
+| CVE-2026-4892 | **YES — test it** | No (DHCPv6 off) | Needs DHCPv6 + `--dhcp-script` |
+| CVE-2026-4893 | If `--add-subnet` used | If `--add-subnet` used | Check dnsmasq config |
+
+#### Platform-Specific Test Scripts
+
+```bash
+# Oak: verify patches in source + test live device
+./dnsmasq_cve_2026/test_oak_cve_2026.sh source
+./dnsmasq_cve_2026/test_oak_cve_2026.sh network 192.168.1.1
+
+# Pinnacle: verify current source is vulnerable, validate sdk_patch, test device
+./dnsmasq_cve_2026/test_pinnacle_cve_2026.sh source-before
+./dnsmasq_cve_2026/test_pinnacle_cve_2026.sh sdk-patch
+./dnsmasq_cve_2026/test_pinnacle_cve_2026.sh network 192.168.1.1
 ```
 
 #### Requirements
@@ -727,11 +779,13 @@ python3 dnsmasq_cve_2026/dnsmasq_cve_tester.py \
 - Python 3.6+ (no external dependencies — uses only `socket`/`struct`)
 - Root/sudo for DHCPv6 tests (CVE-2026-4892)
 - Network access to target for live tests
+- `dig` or `nslookup` for platform test scripts
 
 #### Notes
 
-- **Network tests may crash a vulnerable dnsmasq** — use on test devices only
-- The `nodhcpv6` build variant (pinnacle) is NOT affected by CVE-2026-4892
+- **Network tests may crash a vulnerable dnsmasq** — use on test devices only, not production
+- After a crash, reboot the DUT before testing the next CVE
+- The `nodhcpv6` build variant (Pinnacle) is NOT affected by CVE-2026-4892
 - CVE-2026-2291 and CVE-2026-5172 have NO mitigation other than patching
 - See `dnsmasq_cve_2026/README.md` for detailed technical background
 
