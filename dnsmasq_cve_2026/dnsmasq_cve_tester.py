@@ -718,118 +718,104 @@ class StaticAnalyzer:
     def check_source(source_dir):
         results = []
 
-        # Check CVE-2026-2291: union bigname buffer size
+        # CVE-2026-2291: union bigname buffer size
+        # FIX: char name[(2*MAXDNAME)+1]  VULN: char name[MAXDNAME]
         dnsmasq_h = os.path.join(source_dir, "src", "dnsmasq.h")
         if os.path.exists(dnsmasq_h):
             with open(dnsmasq_h, "r") as f:
                 content = f.read()
-            if "char name[MAXDNAME]" in content and "union bigname" in content:
-                # Check if the fix (2*MAXDNAME or MAXDNAME*2) is present
-                if "2*MAXDNAME" in content or "MAXDNAME*2" in content or "(2*MAXDNAME)" in content:
-                    results.append(("CVE-2026-2291", "PATCHED",
-                                    "union bigname uses 2*MAXDNAME buffer"))
-                else:
-                    results.append(("CVE-2026-2291", "VULNERABLE",
-                                    "union bigname uses only MAXDNAME - heap overflow possible"))
+            if "2*MAXDNAME" in content or "2 * MAXDNAME" in content or "MAXDNAME*2" in content:
+                results.append(("CVE-2026-2291", "PATCHED",
+                                "bigname buffer enlarged to 2*MAXDNAME"))
+            elif "char name[MAXDNAME]" in content:
+                results.append(("CVE-2026-2291", "VULNERABLE",
+                                "bigname buffer is only MAXDNAME — heap overflow"))
             else:
-                results.append(("CVE-2026-2291", "UNKNOWN", "Could not find union bigname in dnsmasq.h"))
+                results.append(("CVE-2026-2291", "UNKNOWN", "Cannot determine buffer size"))
+        else:
+            results.append(("CVE-2026-2291", "UNKNOWN", "dnsmasq.h not found"))
 
-        # Check CVE-2026-5172: extract_addresses rdlen validation
+        # CVE-2026-5172: extract_addresses rdlen bounds check
+        # FIX adds: "if (p1 > endrr)" after extract_name in extract_addresses
         rfc1035_c = os.path.join(source_dir, "src", "rfc1035.c")
         if os.path.exists(rfc1035_c):
             with open(rfc1035_c, "r") as f:
                 content = f.read()
-            # The fix adds bounds checking on p1 after extract_name in extract_addresses
-            # Look for the pattern of checking if p1 exceeded the record boundary
-            if "extract_addresses" in content:
-                # Heuristic: look for rdlen bounds check near extract_name calls
-                # in extract_addresses function
-                lines = content.split("\n")
-                in_func = False
-                has_bounds_check = False
-                for i, line in enumerate(lines):
-                    if "extract_addresses" in line and "{" in line:
-                        in_func = True
-                    if in_func:
-                        # Look for the fix pattern: checking p1 against end/endrr
-                        if ("p1 >" in line or "p1 >=" in line or
-                                "endrr" in line and "p1" in line):
-                            has_bounds_check = True
-                            break
-                        if in_func and line.strip().startswith("}") and not "if" in line:
-                            # May have left function - rough heuristic
-                            pass
-                if has_bounds_check:
-                    results.append(("CVE-2026-5172", "LIKELY PATCHED",
-                                    "Found p1/endrr bounds check in extract_addresses"))
-                else:
-                    results.append(("CVE-2026-5172", "LIKELY VULNERABLE",
-                                    "No rdlen bounds check found after extract_name in extract_addresses"))
+            if "p1 > endrr" in content or "p1 >= endrr" in content:
+                results.append(("CVE-2026-5172", "PATCHED",
+                                "p1 > endrr bounds check present"))
+            else:
+                results.append(("CVE-2026-5172", "VULNERABLE",
+                                "no p1 vs endrr bounds check — OOB read possible"))
+        else:
+            results.append(("CVE-2026-5172", "UNKNOWN", "rfc1035.c not found"))
 
-        # Check CVE-2026-4890: NSEC bitmap parsing
+        # CVE-2026-4890: NSEC bitmap advance
+        # FIX: "p += p[1] + 2" and "rdlen -= p[1] + 2"
+        # VULN: "p +=  p[1]" and "rdlen -= p[1]" (without +2)
         dnssec_c = os.path.join(source_dir, "src", "dnssec.c")
         if os.path.exists(dnssec_c):
             with open(dnssec_c, "r") as f:
                 content = f.read()
-            # The fix changes p[1] to p[1]+2 in the bitmap advance
-            # and adds a check for bitmap_length == 0
-            if "p[1]" in content:
-                # Look for the corrected pattern: p += p[1] + 2 (not just p += p[1])
-                if "p[1] + 2" in content or "p[1]+2" in content or "2 + p[1]" in content:
-                    results.append(("CVE-2026-4890", "LIKELY PATCHED",
-                                    "NSEC bitmap advances by p[1]+2 (includes window header)"))
-                else:
-                    results.append(("CVE-2026-4890", "LIKELY VULNERABLE",
-                                    "NSEC bitmap may advance by p[1] only (missing +2 for window header)"))
-            results_4891_done = False
-            # Check CVE-2026-4891: RRSIG rdlen validation
-            if "validate_rrset" in content or "sig_len" in content:
-                # The fix validates that rdlen >= fixed_fields + signer_name
-                if ("sig_len" in content and
-                        ("< 0" in content or "<= 0" in content or "sig_len >" in content)):
-                    results.append(("CVE-2026-4891", "LIKELY PATCHED",
-                                    "Found signature length validation in RRSIG processing"))
-                else:
-                    results.append(("CVE-2026-4891", "LIKELY VULNERABLE",
-                                    "No rdlen underflow check found in RRSIG processing"))
-                results_4891_done = True
-            if not results_4891_done:
-                results.append(("CVE-2026-4891", "N/A", "dnssec.c not found or no DNSSEC support"))
-        else:
-            results.append(("CVE-2026-4890", "N/A", "No dnssec.c - DNSSEC not compiled"))
-            results.append(("CVE-2026-4891", "N/A", "No dnssec.c - DNSSEC not compiled"))
+            if "p[1] + 2" in content or "p[1]+2" in content:
+                results.append(("CVE-2026-4890", "PATCHED",
+                                "bitmap advances by p[1]+2"))
+            elif "p +=  p[1]" in content or "p += p[1]" in content:
+                results.append(("CVE-2026-4890", "VULNERABLE",
+                                "bitmap advances by p[1] only — infinite loop possible"))
+            else:
+                results.append(("CVE-2026-4890", "UNKNOWN", "Cannot find bitmap advance pattern"))
 
-        # Check CVE-2026-4892: DHCPv6 helper CLID overflow
+            # CVE-2026-4891: RRSIG rdlen validation before sig_len
+            # FIX adds: "(p - psav) > rdlen" check before computing sig_len
+            if "p - psav" in content and "rdlen" in content and (
+                    "p - psav) > rdlen" in content or "p - psav) >= rdlen" in content):
+                results.append(("CVE-2026-4891", "PATCHED",
+                                "(p - psav) > rdlen check present"))
+            elif "sig_len = rdlen - (p - psav)" in content or "sig_len" in content:
+                results.append(("CVE-2026-4891", "VULNERABLE",
+                                "sig_len computed without rdlen bounds check — OOB read possible"))
+            else:
+                results.append(("CVE-2026-4891", "UNKNOWN", "Cannot find sig_len pattern"))
+        else:
+            results.append(("CVE-2026-4890", "N/A", "No dnssec.c — DNSSEC not compiled"))
+            results.append(("CVE-2026-4891", "N/A", "No dnssec.c — DNSSEC not compiled"))
+
+        # CVE-2026-4892: DHCPv6 CLID hex-encoding overflow
+        # FIX adds: clid_max/packet_buff_sz check before the hex encoding loop
+        # VULN: "for (p = daemon->packet, i = 0; i < data.clid_len" without length limit
         helper_c = os.path.join(source_dir, "src", "helper.c")
         if os.path.exists(helper_c):
             with open(helper_c, "r") as f:
                 content = f.read()
-            # The fix adds length checking before hex-encoding CLID into daemon->packet
-            if "%.2x" in content or "%02x" in content:
-                # Look for bounds checking near the hex encoding
-                if ("DHCP_BUFF_SZ" in content or "sizeof(daemon->packet)" in content or
-                        "clid_len" in content and (">" in content or "truncat" in content.lower())):
-                    results.append(("CVE-2026-4892", "POSSIBLY PATCHED",
-                                    "Found potential bounds check near CLID hex encoding"))
-                else:
-                    results.append(("CVE-2026-4892", "LIKELY VULNERABLE",
-                                    "CLID hex-encoded into fixed buffer without length check"))
+            if "clid_max" in content or "packet_buff_sz / 3" in content or "packet_buff_sz) / 3" in content:
+                results.append(("CVE-2026-4892", "PATCHED",
+                                "CLID length bounded before hex encoding"))
+            elif "for (p = daemon->packet" in content and "data.clid_len" in content:
+                results.append(("CVE-2026-4892", "VULNERABLE",
+                                "CLID hex-encoded without length limit — heap overflow possible"))
+            else:
+                results.append(("CVE-2026-4892", "UNKNOWN", "Cannot find CLID encoding pattern"))
         else:
             results.append(("CVE-2026-4892", "N/A", "No helper.c found"))
 
-        # Check CVE-2026-4893: ECS check_source parameter
+        # CVE-2026-4893: ECS check_source parameter
+        # FIX: check_source(header, n, ...)  VULN: check_source(header, plen, ...)
         forward_c = os.path.join(source_dir, "src", "forward.c")
         if os.path.exists(forward_c):
             with open(forward_c, "r") as f:
                 content = f.read()
-            if "check_source" in content:
-                # The fix passes the full packet length instead of opt record length
-                # This is hard to detect statically without deep analysis
-                results.append(("CVE-2026-4893", "NEEDS MANUAL REVIEW",
-                                "check_source() present - verify it receives full packet length, not OPT rdlen"))
-            else:
+            if "check_source(header, n," in content:
+                results.append(("CVE-2026-4893", "PATCHED",
+                                "check_source receives full packet length"))
+            elif "check_source(header, plen," in content:
+                results.append(("CVE-2026-4893", "VULNERABLE",
+                                "check_source receives OPT length — validation bypassed"))
+            elif "check_source" not in content:
                 results.append(("CVE-2026-4893", "N/A",
-                                "No check_source in forward.c - --add-subnet likely not supported"))
+                                "No check_source — --add-subnet not supported"))
+            else:
+                results.append(("CVE-2026-4893", "UNKNOWN", "Cannot determine check_source parameter"))
         else:
             results.append(("CVE-2026-4893", "N/A", "No forward.c found"))
 
