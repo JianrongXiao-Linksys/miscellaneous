@@ -712,126 +712,42 @@ python3 dnsmasq_cve_2026/dnsmasq_cve_tester.py --binary /usr/sbin/dnsmasq
 
 #### Replicate Against a Live Device (QA Test Procedure)
 
-**Why a malicious DNS server is needed:** dnsmasq only processes DNS responses from its configured upstream server. Sending crafted packets directly to dnsmasq's port 53 won't reach the vulnerable code path. To trigger crashes, we run a malicious DNS server on the test host and configure the DUT to use it as upstream.
-
-**Prerequisites:**
-- DUT (Device Under Test) running unpatched firmware on 192.168.1.1
-- Test host on the same LAN (e.g., 192.168.1.100) with Python 3.6+
-- Serial/SSH access to DUT for crash monitoring and configuration
-
----
-
-**Step 1 — Start the malicious DNS server on your test host:**
-
+**One-time DUT setup** (serial/SSH into DUT):
 ```bash
-cd dnsmasq_cve_2026/
-
-# With root (uses standard DNS port 53):
-sudo python3 malicious_dns_server.py
-
-# Without root (uses port 5353):
-python3 malicious_dns_server.py --port 5353
-```
-
-**Step 2 — On the DUT (serial/SSH), configure dnsmasq to use your test host as upstream:**
-
-```bash
-# If using port 53:
-echo "server=192.168.1.100" >> /etc/dnsmasq.conf
-
-# If using port 5353:
-echo "server=192.168.1.100#5353" >> /etc/dnsmasq.conf
-
-# Restart dnsmasq to pick up the new upstream
+# Add test host as upstream DNS (replace IP with your test PC's IP)
+echo "server=/evil.test/192.168.1.254#5353" >> /etc/dnsmasq.conf
 killall -HUP dnsmasq
 ```
 
-**Step 3 — On the DUT, monitor for crash:**
-
+**Run test** (from test host):
 ```bash
-tail -f /var/log/messages* &
-while true; do pidof dnsmasq > /dev/null || echo "*** DNSMASQ CRASHED at $(date) ***"; sleep 1; done &
+cd dnsmasq_cve_2026/
+
+# Start malicious server + trigger all CVEs + report PASS/FAIL:
+python3 malicious_dns_server.py --port 5353 &
+sleep 1
+dig @192.168.1.1 crash-5172.evil.test    # CVE-2026-5172
+dig @192.168.1.1 crash-2291.evil.test    # CVE-2026-2291 (DNSSEC only)
+dig @192.168.1.1 crash-4890.evil.test    # CVE-2026-4890 (DNSSEC only)
 ```
 
-**Step 4 — From your test host, trigger each CVE:**
+**Result**: If dnsmasq crashes on the DUT → **FAIL** (vulnerable). If it stays alive → **PASS** (patched).
 
-```bash
-# CVE-2026-5172 (HIGH) — crash via falsified rdlen (works on all builds)
-dig @192.168.1.1 crash-5172.evil.test
+Check on DUT: `pidof dnsmasq` — empty means it crashed.
 
-# CVE-2026-2291 (CRITICAL) — heap overflow via escaped name (DNSSEC builds only)
-dig @192.168.1.1 crash-2291.evil.test
+#### What each trigger does
 
-# CVE-2026-4890 (HIGH) — infinite loop via NSEC bitmap (DNSSEC builds only)
-dig @192.168.1.1 crash-4890.evil.test
-```
-
-**Step 5 — Observe results on DUT console:**
-
-| CVE | Trigger domain | What happens on DUT | Vulnerable if... |
-|-----|---------------|--------------------|-----------------| 
-| CVE-2026-5172 | `crash-5172.evil.test` | dnsmasq segfaults | `pidof dnsmasq` returns empty |
-| CVE-2026-2291 | `crash-2291.evil.test` | dnsmasq segfaults | `pidof dnsmasq` returns empty (DNSSEC only) |
-| CVE-2026-4890 | `crash-4890.evil.test` | dnsmasq hangs, 100% CPU | DNS stops responding, process alive but frozen |
-| CVE-2026-4893 | (use direct tester) | No crash — functional bug | `dnsmasq_cve_tester.py --target` reports VULNERABLE |
-
-**Step 6 — After applying patches, reflash the DUT and repeat Steps 2-5.**
-
-All triggers should now result in dnsmasq remaining alive and responsive.
-
----
-
-**CVE-2026-4892 (DHCPv6 CLID overflow)** — requires separate test:
-```bash
-# From a host on the same IPv6 LAN segment (needs root):
-sudo python3 dnsmasq_cve_tester.py --target 192.168.1.1 --test CVE-2026-4892
-# Monitor DUT: dmesg | grep segfault (helper process crash)
-```
-
-**CVE-2026-4893 (ECS bypass)** — no crash, use the direct tester:
-```bash
-python3 dnsmasq_cve_tester.py --target 192.168.1.1 --test CVE-2026-4893
-# Reports VULNERABLE if --add-subnet is active and source validation is bypassed
-```
-
-#### Platform Applicability
-
-| CVE | Oak (dnsmasq 2.78) | Pinnacle nodhcpv6 (2.90) | Notes |
-|-----|-------------------|--------------------------|-------|
-| CVE-2026-2291 | **YES — test it** | **YES — test it** | Always reachable via DNS |
-| CVE-2026-5172 | **YES — test it** | **YES — test it** | Always reachable via DNS |
-| CVE-2026-4890 | No (DNSSEC off) | Only if `full` variant | Needs `--dnssec` enabled |
-| CVE-2026-4891 | No (DNSSEC off) | Only if `full` variant | Needs `--dnssec` enabled |
-| CVE-2026-4892 | **YES — test it** | No (DHCPv6 off) | Needs DHCPv6 + `--dhcp-script` |
-| CVE-2026-4893 | If `--add-subnet` used | If `--add-subnet` used | Check dnsmasq config |
-
-#### Platform-Specific Test Scripts
-
-```bash
-# Oak: verify patches in source + test live device
-./dnsmasq_cve_2026/test_oak_cve_2026.sh source
-./dnsmasq_cve_2026/test_oak_cve_2026.sh network 192.168.1.1
-
-# Pinnacle: verify current source is vulnerable, validate sdk_patch, test device
-./dnsmasq_cve_2026/test_pinnacle_cve_2026.sh source-before
-./dnsmasq_cve_2026/test_pinnacle_cve_2026.sh sdk-patch
-./dnsmasq_cve_2026/test_pinnacle_cve_2026.sh network 192.168.1.1
-```
+| Trigger | CVE | PASS | FAIL |
+|---------|-----|------|------|
+| `dig @DUT crash-5172.evil.test` | CVE-2026-5172 | dnsmasq alive | dnsmasq crashed |
+| `dig @DUT crash-2291.evil.test` | CVE-2026-2291 | dnsmasq alive | dnsmasq crashed (DNSSEC builds only) |
+| `dig @DUT crash-4890.evil.test` | CVE-2026-4890 | dnsmasq responds | dnsmasq hangs at 100% CPU (DNSSEC builds only) |
 
 #### Requirements
 
-- Python 3.6+ (no external dependencies — uses only `socket`/`struct`)
-- Root/sudo for DHCPv6 tests (CVE-2026-4892)
-- Network access to target for live tests
-- `dig` or `nslookup` for platform test scripts
-
-#### Notes
-
-- **Network tests may crash a vulnerable dnsmasq** — use on test devices only, not production
-- After a crash, reboot the DUT before testing the next CVE
-- The `nodhcpv6` build variant (Pinnacle) is NOT affected by CVE-2026-4892
-- CVE-2026-2291 and CVE-2026-5172 have NO mitigation other than patching
-- See `dnsmasq_cve_2026/README.md` for detailed technical background
+- Python 3.6+ on test host (no external dependencies)
+- DUT and test host on same LAN
+- Serial/SSH access to DUT for one-time setup
 
 ---
 
