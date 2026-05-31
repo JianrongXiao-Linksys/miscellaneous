@@ -710,44 +710,36 @@ python3 dnsmasq_cve_2026/dnsmasq_cve_tester.py \
 python3 dnsmasq_cve_2026/dnsmasq_cve_tester.py --binary /usr/sbin/dnsmasq
 ```
 
-#### Replicate Against a Live Device (QA Test Procedure)
+#### QA Test Procedure — Verify on Device (No Source Code Needed)
 
-**One-time DUT setup** (serial/SSH into DUT):
+**Step 1:** Copy script to DUT:
 ```bash
-# Add test host as upstream DNS (replace IP with your test PC's IP)
-echo "server=/evil.test/192.168.1.254#5353" >> /etc/dnsmasq.conf
-killall -HUP dnsmasq
+scp dnsmasq_cve_2026/test_dnsmasq_cve_on_device.sh root@192.168.1.1:/tmp/
 ```
 
-**Run test** (from test host):
+**Step 2:** Run on DUT:
 ```bash
-cd dnsmasq_cve_2026/
-
-# Start malicious server + trigger all CVEs + report PASS/FAIL:
-python3 malicious_dns_server.py --port 5353 &
-sleep 1
-dig @192.168.1.1 crash-5172.evil.test    # CVE-2026-5172
-dig @192.168.1.1 crash-2291.evil.test    # CVE-2026-2291 (DNSSEC only)
-dig @192.168.1.1 crash-4890.evil.test    # CVE-2026-4890 (DNSSEC only)
+ssh root@192.168.1.1 "sh /tmp/test_dnsmasq_cve_on_device.sh"
 ```
 
-**Result**: If dnsmasq crashes on the DUT → **FAIL** (vulnerable). If it stays alive → **PASS** (patched).
+**Step 3:** Read result:
+```
+  CVE-2026-2291 (heap overflow):     FAIL (version 2.78 < 2.92rel2)
+  CVE-2026-5172 (OOB read crash):    FAIL (version 2.78 < 2.92rel2)
+  CVE-2026-4890 (NSEC DoS):          N/A (DNSSEC not compiled)
+  CVE-2026-4891 (RRSIG OOB read):    N/A (DNSSEC not compiled)
+  CVE-2026-4892 (CLID overflow):     FAIL (version 2.78 < 2.92rel2)
+  CVE-2026-4893 (ECS bypass):        FAIL (version 2.78 < 2.92rel2)
 
-Check on DUT: `pidof dnsmasq` — empty means it crashed.
+  RESULT: FAIL — 4/6 vulnerable
+```
 
-#### What each trigger does
-
-| Trigger | CVE | PASS | FAIL |
-|---------|-----|------|------|
-| `dig @DUT crash-5172.evil.test` | CVE-2026-5172 | dnsmasq alive | dnsmasq crashed |
-| `dig @DUT crash-2291.evil.test` | CVE-2026-2291 | dnsmasq alive | dnsmasq crashed (DNSSEC builds only) |
-| `dig @DUT crash-4890.evil.test` | CVE-2026-4890 | dnsmasq responds | dnsmasq hangs at 100% CPU (DNSSEC builds only) |
+**After applying fix:** Re-run same script. Expect all PASS or N/A.
 
 #### Requirements
 
-- Python 3.6+ on test host (no external dependencies)
-- DUT and test host on same LAN
-- Serial/SSH access to DUT for one-time setup
+- SSH access to DUT
+- Script uses only `strings`, `grep`, `sh` — no Python needed on device
 
 ---
 
