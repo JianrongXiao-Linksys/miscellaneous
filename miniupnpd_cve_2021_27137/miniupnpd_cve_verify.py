@@ -47,7 +47,7 @@ BOLD = "\033[1m"
 
 TOOL_VERSION = "3.0.0"
 
-SOAP_ACTION = "urn:schemas-upnp-org:service:WANIPConnection:1#GetExternalIPAddress"
+SOAP_ACTION = "urn:schemas-upnp-org:service:WANIPConnection:1#AddPortMapping"
 
 # The syslog message that the patched miniupnpd emits
 FIX_LOG_SIGNATURE = "CVE-2021-27137"
