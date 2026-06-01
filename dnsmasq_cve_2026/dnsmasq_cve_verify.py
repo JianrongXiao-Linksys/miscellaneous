@@ -157,15 +157,19 @@ class DUTConnection:
         return out.strip()
 
     def get_dnsmasq_version(self):
-        out, _, _ = self.exec("dnsmasq --version 2>/dev/null | head -1 || "
-                              "/sbin/dnsmasq --version 2>/dev/null | head -1 || "
-                              "/usr/sbin/dnsmasq --version 2>/dev/null | head -1")
+        out, _, _ = self.exec(
+            "BIN=$(which dnsmasq 2>/dev/null || echo /sbin/dnsmasq); "
+            "[ -x \"$BIN\" ] || BIN=/usr/sbin/dnsmasq; "
+            "$BIN --version 2>/dev/null | head -1"
+        )
         return out
 
     def get_compile_options(self):
-        out, _, _ = self.exec("dnsmasq --version 2>/dev/null | head -5 || "
-                              "/sbin/dnsmasq --version 2>/dev/null | head -5 || "
-                              "/usr/sbin/dnsmasq --version 2>/dev/null | head -5")
+        out, _, _ = self.exec(
+            "BIN=$(which dnsmasq 2>/dev/null || echo /sbin/dnsmasq); "
+            "[ -x \"$BIN\" ] || BIN=/usr/sbin/dnsmasq; "
+            "$BIN --version 2>/dev/null | head -5"
+        )
         return out
 
     def check_dmesg_crash(self):
