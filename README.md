@@ -37,7 +37,7 @@ Each tool is documented with its purpose, usage instructions, and technical deta
 |------|--------|-------------|
 | [WiFi Client Monitor](#wifi-client-monitor) | [`monitor_wifi_clients.sh`](scripts/monitor_wifi_clients.sh) | Monitor client associations on wireless interface |
 | [Register Dump](#register-dump-5ghz-radio-debug) | [`Reg_dump.sh`](scripts/Reg_dump.sh) | Capture MAC/PHY registers for 5GHz radio debugging |
-| [CVE-2021-27137 Exploit Test](#cve-2021-27137-miniupnpd-exploit-test) | [`test_CVE-2021-27137_miniupnpd.sh`](test_CVE-2021-27137_miniupnpd.sh) | On-device exploit test for miniupnpd XML parser buffer overflow |
+| [CVE-2021-27137 Exploit Test](#cve-2021-27137-miniupnpd-exploit-test) | [`miniupnpd_cve_2021_27137/`](miniupnpd_cve_2021_27137/) | CVE-2021-27137 miniupnpd test suite (verify, exploit, on-device) |
 | [Strip Sensitive Data](#strip-sensitive-data) | [`strip-sensitive.py`](scripts/strip-sensitive.py) | Remove PII/secrets from code/logs before sharing with LLMs |
 | [CVE-2026 dnsmasq Tester](#cve-2026-dnsmasq-vulnerability-tester) | [`dnsmasq_cve_2026/dnsmasq_cve_tester.py`](dnsmasq_cve_2026/dnsmasq_cve_tester.py) | Network + static analysis test suite for 6 dnsmasq CVEs (May 2026) |
 
@@ -417,7 +417,7 @@ Collection 2 - Timestamp: ...
 
 ### CVE-2021-27137 miniupnpd Exploit Test
 
-**Script:** `test_CVE-2021-27137_miniupnpd.sh`
+**Directory:** [`miniupnpd_cve_2021_27137/`](miniupnpd_cve_2021_27137/) — Full test suite (see `miniupnpd_cve_2021_27137/README.md` for details)
 
 **Purpose:** On-device exploit test to verify that miniupnpd correctly handles truncated XML attributes (buffer read overflow in `minixml.c` `parseatt()` function).
 
@@ -754,7 +754,7 @@ miscellaneous/
 │   ├── Reg_dump.sh                        # 5GHz radio register dump diagnostic
 │   ├── strip-sensitive.py                 # PII/secrets stripping tool
 │   └── strip-sensitive-config.example.json # Example config for strip-sensitive
-├── test_CVE-2021-27137_miniupnpd.sh     # CVE-2021-27137 on-device exploit test
+├── miniupnpd_cve_2021_27137/              # CVE-2021-27137 test suite (verify + exploit + on-device)
 ├── dnsmasq_cve_2026/                     # CVE-2026 dnsmasq vulnerability test suite
 │   ├── dnsmasq_cve_tester.py            # Main test tool (network + static analysis)
 │   └── README.md                         # Detailed usage documentation
