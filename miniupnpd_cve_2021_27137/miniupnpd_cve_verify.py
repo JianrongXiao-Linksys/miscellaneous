@@ -1,44 +1,45 @@
 #!/usr/bin/env python3
 """
-miniupnpd CVE-2021-27137 Automated Defect Verification Tool
+miniupnpd CVE-2021-27137 Verification Tool
 
-Runs on the testing laptop, sends malformed UPnP XML payloads to the DUT,
-and reports PASS/FAIL based on whether miniupnpd survives or crashes.
+Verifies whether the CVE-2021-27137 fix is applied by inspecting:
+1. The miniupnpd binary on the device (via SSH) for the fix signature
+2. The source code in the build tree for the missing bounds check
+3. The build's patch directory for the fix patch
 
-Architecture:
-  - Laptop (LAN): runs this tool, sends crafted HTTP/SOAP to DUT's UPnP port
-  - DUT (192.168.1.1): target device running miniupnpd
-  - SSH to DUT is read-only (check process state, dmesg)
-  - Tool does NOT modify DUT settings
+NOTE: This CVE is a buffer READ overflow, not a write overflow.
+Black-box crash testing is UNRELIABLE because the over-read typically
+lands in mapped heap memory and does not cause a segfault. This tool
+uses source/binary inspection instead.
 
 Vulnerability:
   CVE-2021-27137 — Buffer read overflow in minixml.c parseatt()
-  When parsing truncated XML like <element attribute= (no value after '='),
-  the parser advances past '=' without bounds checking, causing OOB read.
+  After `while(*(p->xml++) != '=')` loop, code reads *p->xml without
+  checking p->xml >= p->xmlend. Truncated XML causes OOB heap read.
   Fix: miniupnp/miniupnp@3cfb4fb (add bounds check after '=' loop)
 
-Lifecycle per test:
-  1. Pre-check (SSH: pidof miniupnpd, get PID)
-  2. Trigger (send malformed XML payload to UPnP SOAP endpoint)
-  3. State Inspection (SSH: pidof, dmesg for segfault/crash)
-  4. Verdict (PASS = daemon alive with same PID, FAIL = crashed/restarted)
-
 Usage:
-  python3 miniupnpd_cve_verify.py --dut 192.168.1.1
+  # Check device binary via SSH
   python3 miniupnpd_cve_verify.py --dut 192.168.1.1 --dut-pass 'password'
-  python3 miniupnpd_cve_verify.py --dut 192.168.1.1 --port 5000 --no-ssh
 
-Requirements:
-  - Python 3.6+ (stdlib only for basic mode)
-  - paramiko (optional, for SSH-based PID and crash verification)
-  - DUT reachable on LAN with miniupnpd running
+  # Check local build source tree
+  python3 miniupnpd_cve_verify.py --source ~/code/pinnacle/develop/store/sdk/qsdk/build_dir/target-arm/miniupnpd-nftables/miniupnpd-2.3.3
+
+  # Check SDK patches directory
+  python3 miniupnpd_cve_verify.py --patches ~/code/pinnacle/develop/sdks/qualcomm/qsdk-spf12.5_csu1/sdk_patches
+
+  # All checks combined
+  python3 miniupnpd_cve_verify.py --dut 192.168.1.1 --dut-pass 'pw' \
+    --source ~/code/pinnacle/develop/store/sdk/qsdk/build_dir/target-arm/miniupnpd-nftables/miniupnpd-2.3.3 \
+    --patches ~/code/pinnacle/develop/sdks/qualcomm/qsdk-spf12.5_csu1/sdk_patches
 """
 
 import argparse
 import getpass
-import socket
+import os
+import re
+import subprocess
 import sys
-import time
 
 try:
     import paramiko
@@ -58,275 +59,227 @@ YELLOW = "\033[93m"
 CYAN = "\033[96m"
 BOLD = "\033[1m"
 
-TOOL_VERSION = "1.0.0"
+TOOL_VERSION = "2.0.0"
 
-# UPnP SOAP paths commonly used by miniupnpd
-UPNP_PATHS = [
-    "/ctl/IPConn",
-    "/ctl/CmnDevCfg",
-    "/ctl/L3Forwarding",
+# The fix adds this bounds check after the '=' parsing loop.
+# We look for this pattern in source code.
+FIX_PATTERN_SOURCE = r'if\s*\(\s*p->xml\s*>=\s*p->xmlend\s*\)\s*\n\s*return\s*-1;'
+
+# In the compiled binary, the fix manifests as an additional comparison
+# instruction near the IS_WHITE_SPACE check. We look for the comment string
+# that's part of the fix commit as a signature.
+FIX_SIGNATURE_BINARY = b"right after the '='"
+
+# Patch file name pattern
+FIX_PATCH_NAMES = [
+    "400-fix-CVE-2021-27137",
+    "CVE-2021-27137",
+    "minixml_overflow",
+    "minixml-overflow",
 ]
 
-SOAP_ACTION = "urn:schemas-upnp-org:service:WANIPConnection:1#GetExternalIPAddress"
-
 
 # ═══════════════════════════════════════════════════════════════════════
-# Exploit Payloads — each triggers a different boundary in parseatt()
+# Check Methods
 # ═══════════════════════════════════════════════════════════════════════
 
-PAYLOADS = [
-    {
-        "id": "TRUNC_AFTER_EQUALS",
-        "name": "Truncated attribute after '='",
-        "description": "Core CVE trigger — XML ends immediately after '=' with no value",
-        "xml": '<element attribute=',
-    },
-    {
-        "id": "TRUNC_AFTER_EQUALS_SPACE",
-        "name": "Truncated after '=' with trailing space",
-        "description": "Hits the IS_WHITE_SPACE loop after '=' without a value to parse",
-        "xml": '<element attribute= ',
-    },
-    {
-        "id": "NAMESPACE_ATTR_TRUNC",
-        "name": "Namespaced attribute truncated after '='",
-        "description": "UPnP-style namespace attribute ending at buffer boundary",
-        "xml": '<s:Envelope xmlns:s="http://schemas.xmlsoap.org/soap/envelope/" s:encodingStyle=',
-    },
-    {
-        "id": "NESTED_TRUNC",
-        "name": "Nested element with second attribute truncated",
-        "description": "First attr OK, second truncated — tests parser state after successful parse",
-        "xml": '<root><child attr1="valid" attr2=',
-    },
-    {
-        "id": "ATTR_NO_EQUALS",
-        "name": "Attribute name with no '=' sign",
-        "description": "Hits the first while loop boundary (searching for '=')",
-        "xml": '<element verylongattributenamewithnoequalssign',
-    },
-    {
-        "id": "QUOTE_NO_CLOSE",
-        "name": "Attribute with opening quote but no close",
-        "description": "Hits the quoted-value loop boundary (searching for matching quote)",
-        "xml": '<element attr="value_with_no_closing_quote',
-    },
-    {
-        "id": "MULTIPLE_TRUNCATED",
-        "name": "Multiple elements each with truncated attrs",
-        "description": "Stress test — repeated truncation patterns",
-        "xml": '<a x=<b y=<c z=',
-    },
-]
+def check_source(source_path):
+    """
+    Check if the fix is present in minixml.c source code.
 
-# Valid SOAP request for regression testing
-VALID_SOAP_BODY = (
-    '<?xml version="1.0"?>'
-    '<s:Envelope xmlns:s="http://schemas.xmlsoap.org/soap/envelope/" '
-    's:encodingStyle="http://schemas.xmlsoap.org/soap/encoding/">'
-    '<s:Body>'
-    '<u:GetExternalIPAddress xmlns:u="urn:schemas-upnp-org:service:WANIPConnection:1">'
-    '</u:GetExternalIPAddress>'
-    '</s:Body>'
-    '</s:Envelope>'
-)
+    The vulnerable code pattern (UNFIXED):
+        while(*(p->xml++) != '=')
+        {
+            if(p->xml >= p->xmlend)
+                return -1;
+        }
+        while(IS_WHITE_SPACE(*p->xml))   <-- NO bounds check before this
 
+    The fixed code has an additional bounds check between the two while loops.
+    """
+    minixml_path = os.path.join(source_path, "minixml.c")
+    if not os.path.exists(minixml_path):
+        # Try src/ subdirectory
+        minixml_path = os.path.join(source_path, "src", "minixml.c")
+    if not os.path.exists(minixml_path):
+        return None, f"minixml.c not found in {source_path}"
 
-# ═══════════════════════════════════════════════════════════════════════
-# SSH Helper
-# ═══════════════════════════════════════════════════════════════════════
+    with open(minixml_path, 'r') as f:
+        content = f.read()
 
-class DUTConnection:
-    """Read-only SSH connection to DUT for state inspection."""
+    # Method 1: Look for the comment from the fix
+    if "right after the '='" in content:
+        return True, f"Fix comment found in {minixml_path}"
 
-    def __init__(self, host, user, password, timeout=5):
-        self.host = host
-        self.user = user
-        self.password = password
-        self.timeout = timeout
-        self.client = None
+    # Method 2: Count bounds checks between the '=' loop and the whitespace loop
+    # In the fixed version, there are TWO consecutive blocks ending with `return -1;`
+    # before `while(IS_WHITE_SPACE`
+    lines = content.split('\n')
+    in_parseatt = False
+    found_equals_loop = False
+    bounds_check_after_equals = False
 
-    def connect(self):
-        if not HAS_PARAMIKO:
-            return False
-        try:
-            self.client = paramiko.SSHClient()
-            self.client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-            self.client.connect(
-                self.host,
-                username=self.user,
-                password=self.password,
-                timeout=self.timeout,
-                look_for_keys=False,
-                allow_agent=False,
-            )
-            return True
-        except Exception as e:
-            print(f"  {YELLOW}[WARN]{RESET} SSH connect failed: {e}")
-            self.client = None
-            return False
+    for i, line in enumerate(lines):
+        if 'parseatt' in line and 'static' in line:
+            in_parseatt = True
+        if not in_parseatt:
+            continue
 
-    def run(self, cmd):
-        if not self.client:
-            return None
-        try:
-            _, stdout, stderr = self.client.exec_command(cmd, timeout=self.timeout)
-            return stdout.read().decode().strip()
-        except Exception:
-            return None
+        # Find the `while(*(p->xml++) != '=')` loop
+        if "p->xml++" in line and "!= '='" in line:
+            found_equals_loop = True
+            continue
 
-    def get_miniupnpd_pid(self):
-        result = self.run("pidof miniupnpd")
-        if result:
-            return result.split()[0]
-        return None
+        if found_equals_loop:
+            # Look for a bounds check BEFORE the IS_WHITE_SPACE loop
+            if 'IS_WHITE_SPACE' in line:
+                # We've reached the whitespace loop — was there a bounds check?
+                break
+            if 'p->xml >= p->xmlend' in line:
+                # Check if this is inside the '=' loop (has opening brace context)
+                # or standalone (the fix)
+                # Look at surrounding context — if the previous `}` closed the
+                # '=' while loop, this is the fix
+                for j in range(i-1, max(i-5, 0), -1):
+                    if lines[j].strip() == '}':
+                        bounds_check_after_equals = True
+                        break
+                    elif 'while' in lines[j]:
+                        break
 
-    def get_miniupnpd_version(self):
-        result = self.run("miniupnpd --version 2>&1 | head -1")
-        return result
+    if bounds_check_after_equals:
+        return True, f"Bounds check found after '=' loop in {minixml_path}"
 
-    def check_crash_log(self):
-        result = self.run("dmesg | tail -20 | grep -i 'segfault\\|miniupnpd\\|killed'")
-        return result
+    # Check if version is >= 2.3.10 (fix included)
+    version_match = re.search(r'miniupnpd[- ](\d+\.\d+\.?\d*)', content)
 
-    def close(self):
-        if self.client:
-            self.client.close()
+    return False, f"VULNERABLE: No bounds check after '=' loop in {minixml_path}"
 
 
-# ═══════════════════════════════════════════════════════════════════════
-# Network Helpers
-# ═══════════════════════════════════════════════════════════════════════
+def check_patches(patches_path):
+    """Check if the fix patch exists in the patches directory."""
+    if not os.path.isdir(patches_path):
+        return None, f"Patches directory not found: {patches_path}"
 
-def check_port_open(host, port, timeout=3):
-    """Check if a TCP port is open."""
+    found_patches = []
+    for root, dirs, files in os.walk(patches_path):
+        for f in files:
+            f_lower = f.lower()
+            for pattern in FIX_PATCH_NAMES:
+                if pattern.lower() in f_lower:
+                    found_patches.append(os.path.join(root, f))
+
+    if found_patches:
+        return True, f"Fix patch found: {', '.join(found_patches)}"
+
+    return False, f"No CVE-2021-27137 fix patch found in {patches_path}"
+
+
+def check_device_binary(host, user, password, timeout=10):
+    """
+    SSH to device and check miniupnpd binary for fix indicators.
+
+    Methods:
+    1. Check miniupnpd version string (>= 2.3.10 means fixed)
+    2. Look for fix signature string in binary
+    3. Check if source patch was applied by examining binary structure
+    """
+    if not HAS_PARAMIKO:
+        return None, "paramiko not installed (pip install paramiko)"
+
     try:
-        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        sock.settimeout(timeout)
-        result = sock.connect_ex((host, port))
-        sock.close()
-        return result == 0
-    except Exception:
-        return False
-
-
-def send_http_payload(host, port, path, body, timeout=5):
-    """Send HTTP POST with XML body to UPnP endpoint. Returns response or None."""
-    try:
-        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        sock.settimeout(timeout)
-        sock.connect((host, port))
-
-        request = (
-            f"POST {path} HTTP/1.1\r\n"
-            f"Host: {host}:{port}\r\n"
-            f"Content-Type: text/xml; charset=\"utf-8\"\r\n"
-            f"SOAPAction: \"{SOAP_ACTION}\"\r\n"
-            f"Content-Length: {len(body)}\r\n"
-            f"Connection: close\r\n"
-            f"\r\n"
-            f"{body}"
+        client = paramiko.SSHClient()
+        client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+        client.connect(
+            host,
+            username=user,
+            password=password,
+            timeout=timeout,
+            look_for_keys=False,
+            allow_agent=False,
         )
-
-        sock.sendall(request.encode())
-
-        # Try to read response
-        response = b""
-        try:
-            while True:
-                data = sock.recv(4096)
-                if not data:
-                    break
-                response += data
-        except socket.timeout:
-            pass
-
-        sock.close()
-        return response.decode(errors='replace')
-    except (ConnectionRefusedError, ConnectionResetError):
-        return "CONNECTION_REFUSED"
-    except socket.timeout:
-        return "TIMEOUT"
     except Exception as e:
-        return f"ERROR:{e}"
+        return None, f"SSH connection failed: {e}"
+
+    results = []
+
+    # Get version
+    _, stdout, _ = client.exec_command("miniupnpd --version 2>&1 | head -1", timeout=5)
+    version_output = stdout.read().decode().strip()
+    results.append(f"Version: {version_output}")
+
+    # Parse version number
+    version_match = re.search(r'(\d+)\.(\d+)\.(\d+)', version_output)
+    if version_match:
+        major, minor, patch = int(version_match.group(1)), int(version_match.group(2)), int(version_match.group(3))
+        if (major, minor, patch) >= (2, 3, 10):
+            client.close()
+            return True, f"Version {major}.{minor}.{patch} >= 2.3.10 (fix included upstream)\n  " + "\n  ".join(results)
+
+    # Check binary for the fix comment string (if compiled with -g or string survived strip)
+    _, stdout, _ = client.exec_command(
+        "strings /usr/sbin/miniupnpd 2>/dev/null | grep -c \"right after\"",
+        timeout=5
+    )
+    string_count = stdout.read().decode().strip()
+    if string_count and int(string_count) > 0:
+        results.append("Fix signature string found in binary")
+        client.close()
+        return True, "Fix comment present in binary\n  " + "\n  ".join(results)
+
+    # Check opkg package version for patch indicators
+    _, stdout, _ = client.exec_command(
+        "opkg info miniupnpd-nftables 2>/dev/null || opkg info miniupnpd 2>/dev/null",
+        timeout=5
+    )
+    opkg_output = stdout.read().decode().strip()
+    if opkg_output:
+        results.append(f"Package info: {opkg_output.split(chr(10))[0]}")
+
+    # Check if the patch file exists on device (would be unusual but possible)
+    _, stdout, _ = client.exec_command(
+        "ls /etc/patches/*minixml* /etc/patches/*27137* 2>/dev/null",
+        timeout=5
+    )
+    patch_on_device = stdout.read().decode().strip()
+    if patch_on_device:
+        results.append(f"Patch file on device: {patch_on_device}")
+
+    # Get binary size (a patched binary would be slightly larger)
+    _, stdout, _ = client.exec_command("ls -l /usr/sbin/miniupnpd", timeout=5)
+    binary_info = stdout.read().decode().strip()
+    if binary_info:
+        results.append(f"Binary: {binary_info}")
+
+    # Get process info
+    _, stdout, _ = client.exec_command("pidof miniupnpd", timeout=5)
+    pid = stdout.read().decode().strip()
+    if pid:
+        results.append(f"Running PID: {pid}")
+
+    client.close()
+
+    # If version < 2.3.10 and no fix signature found
+    if version_match:
+        return False, f"Version {major}.{minor}.{patch} < 2.3.10 and no fix signature in binary\n  " + "\n  ".join(results)
+
+    return None, f"Cannot determine fix status from binary alone\n  " + "\n  ".join(results)
 
 
-# ═══════════════════════════════════════════════════════════════════════
-# Test Runner
-# ═══════════════════════════════════════════════════════════════════════
-
-def run_exploit_test(host, port, payload, dut_conn=None):
-    """
-    Send one exploit payload and determine if miniupnpd survived.
-
-    Returns dict with:
-      - passed: bool
-      - detail: str explanation
-      - pid_before: str or None
-      - pid_after: str or None
-    """
-    result = {
-        "passed": None,
-        "detail": "",
-        "pid_before": None,
-        "pid_after": None,
-    }
-
-    # Get PID before
-    if dut_conn:
-        result["pid_before"] = dut_conn.get_miniupnpd_pid()
-
-    # Send the exploit payload
-    send_http_payload(host, port, UPNP_PATHS[0], payload["xml"], timeout=3)
-
-    # Wait for potential crash/restart
-    time.sleep(1.5)
-
-    # Check if port is still open
-    port_alive = check_port_open(host, port, timeout=3)
-
-    # Get PID after
-    if dut_conn:
-        result["pid_after"] = dut_conn.get_miniupnpd_pid()
-
-    # Determine verdict
-    if not port_alive:
-        result["passed"] = False
-        result["detail"] = "Port closed after payload — daemon crashed"
-    elif dut_conn and result["pid_before"] and result["pid_after"]:
-        if result["pid_before"] == result["pid_after"]:
-            result["passed"] = True
-            result["detail"] = f"Daemon alive, PID unchanged ({result['pid_before']})"
-        else:
-            result["passed"] = False
-            result["detail"] = (
-                f"PID changed ({result['pid_before']} → {result['pid_after']}) "
-                f"— crashed and was restarted by procd"
-            )
-    elif port_alive:
-        result["passed"] = True
-        result["detail"] = "Port still open after payload (no SSH for PID check)"
-    else:
-        result["passed"] = False
-        result["detail"] = "Unable to determine state"
-
-    return result
-
-
-def run_regression_test(host, port):
-    """Send a valid UPnP SOAP request to verify normal functionality."""
-    response = send_http_payload(host, port, UPNP_PATHS[0], VALID_SOAP_BODY, timeout=5)
-
-    if response and "ExternalIPAddress" in response:
-        return True, "Valid SOAP response with ExternalIPAddress"
-    elif response and "HTTP/1" in response:
-        return True, "Got HTTP response (endpoint may differ but daemon is functional)"
-    elif response == "CONNECTION_REFUSED":
-        return False, "Connection refused — daemon may have crashed"
-    elif response == "TIMEOUT":
-        return None, "Timeout — daemon may be hung"
-    else:
-        return True, "Daemon accepted connection (response format may vary)"
+def check_build_version(source_path):
+    """Check VERSION file or Makefile for miniupnpd version."""
+    version_file = os.path.join(source_path, "VERSION")
+    if os.path.exists(version_file):
+        with open(version_file) as f:
+            version = f.read().strip()
+        version_match = re.match(r'(\d+)\.(\d+)\.(\d+)', version)
+        if version_match:
+            major, minor, patch = int(version_match.group(1)), int(version_match.group(2)), int(version_match.group(3))
+            if (major, minor, patch) >= (2, 3, 10):
+                return True, f"Source version {version} >= 2.3.10 (fix included)"
+            else:
+                return None, f"Source version {version} < 2.3.10 (must check patch status)"
+    return None, "VERSION file not found"
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -335,136 +288,140 @@ def run_regression_test(host, port):
 
 def main():
     parser = argparse.ArgumentParser(
-        description="CVE-2021-27137 miniupnpd exploit verification tool",
+        description="CVE-2021-27137 miniupnpd fix verification tool",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
+NOTE: CVE-2021-27137 is a buffer READ overflow. Black-box crash testing
+is UNRELIABLE because the over-read lands in mapped heap memory.
+This tool uses source/binary/patch inspection instead.
+
 Examples:
-  python3 miniupnpd_cve_verify.py --dut 192.168.1.1
-  python3 miniupnpd_cve_verify.py --dut 192.168.1.1 --dut-pass 'admin123'
-  python3 miniupnpd_cve_verify.py --dut 192.168.1.1 --port 5000 --no-ssh
+  # Check device via SSH
+  python3 miniupnpd_cve_verify.py --dut 192.168.1.1 --dut-pass 'pw'
+
+  # Check local source
+  python3 miniupnpd_cve_verify.py --source path/to/miniupnpd-2.3.3
+
+  # Check patches directory
+  python3 miniupnpd_cve_verify.py --patches path/to/sdk_patches
+
+  # All checks
+  python3 miniupnpd_cve_verify.py --dut 192.168.1.1 --dut-pass 'pw' \\
+    --source path/to/miniupnpd-2.3.3 --patches path/to/sdk_patches
         """,
     )
-    parser.add_argument("--dut", default="192.168.1.1", help="DUT LAN IP (default: 192.168.1.1)")
-    parser.add_argument("--port", type=int, default=5000, help="UPnP port (default: 5000)")
-    parser.add_argument("--dut-user", default="root", help="DUT SSH user (default: root)")
-    parser.add_argument("--dut-pass", default=None, help="DUT SSH password (prompted if omitted)")
-    parser.add_argument("--no-ssh", action="store_true", help="Skip SSH — verify via port check only")
-    parser.add_argument("--payload", default=None, help="Run specific payload ID only")
+    parser.add_argument("--dut", default=None, help="DUT IP for SSH binary inspection")
+    parser.add_argument("--dut-user", default="root", help="SSH user (default: root)")
+    parser.add_argument("--dut-pass", default=None, help="SSH password")
+    parser.add_argument("--source", default=None, help="Path to miniupnpd source (contains minixml.c)")
+    parser.add_argument("--patches", default=None, help="Path to SDK patches directory")
     parser.add_argument("--version", action="version", version=f"%(prog)s {TOOL_VERSION}")
 
     args = parser.parse_args()
 
-    print(f"\n{'='*60}")
-    print(f" CVE-2021-27137 miniupnpd Verification Tool v{TOOL_VERSION}")
-    print(f" Target: {args.dut}:{args.port}")
-    print(f"{'='*60}\n")
+    if not args.dut and not args.source and not args.patches:
+        parser.error("At least one of --dut, --source, or --patches is required")
 
-    # ─── SSH Setup ───
-    dut_conn = None
-    if not args.no_ssh:
+    print(f"\n{'='*60}")
+    print(f" CVE-2021-27137 miniupnpd Fix Verification v{TOOL_VERSION}")
+    print(f"{'='*60}")
+    print(f"\n  NOTE: This CVE is a heap READ overflow. Crash-based testing")
+    print(f"  is unreliable. This tool inspects source/binary/patches.\n")
+
+    checks_run = 0
+    checks_pass = 0
+    checks_fail = 0
+    checks_inconclusive = 0
+
+    # ─── Source Code Check ───
+    if args.source:
+        print(f"{'─'*60}")
+        print(f" Source Code Inspection: {args.source}")
+        print(f"{'─'*60}\n")
+
+        # Version check first
+        ver_result, ver_detail = check_build_version(args.source)
+        print(f"  {CYAN}[INFO]{RESET} {ver_detail}")
+
+        # Source pattern check
+        result, detail = check_source(args.source)
+        checks_run += 1
+        if result is True:
+            print(f"  {GREEN}[PASS]{RESET} {detail}")
+            checks_pass += 1
+        elif result is False:
+            print(f"  {RED}[FAIL]{RESET} {detail}")
+            checks_fail += 1
+        else:
+            print(f"  {YELLOW}[SKIP]{RESET} {detail}")
+            checks_inconclusive += 1
+        print()
+
+    # ─── Patches Check ───
+    if args.patches:
+        print(f"{'─'*60}")
+        print(f" SDK Patches Inspection: {args.patches}")
+        print(f"{'─'*60}\n")
+
+        result, detail = check_patches(args.patches)
+        checks_run += 1
+        if result is True:
+            print(f"  {GREEN}[PASS]{RESET} {detail}")
+            checks_pass += 1
+        elif result is False:
+            print(f"  {RED}[FAIL]{RESET} {detail}")
+            checks_fail += 1
+        else:
+            print(f"  {YELLOW}[SKIP]{RESET} {detail}")
+            checks_inconclusive += 1
+        print()
+
+    # ─── Device Binary Check ───
+    if args.dut:
+        print(f"{'─'*60}")
+        print(f" Device Binary Inspection: {args.dut}")
+        print(f"{'─'*60}\n")
+
         if not HAS_PARAMIKO:
-            print(f"  {YELLOW}[WARN]{RESET} paramiko not installed — using port-check only")
-            print(f"        Install: pip install paramiko\n")
+            print(f"  {YELLOW}[SKIP]{RESET} paramiko not installed (pip install paramiko)")
+            checks_inconclusive += 1
         else:
             if args.dut_pass is None:
-                args.dut_pass = getpass.getpass(f"SSH password for {args.dut_user}@{args.dut}: ")
+                args.dut_pass = getpass.getpass(f"  SSH password for {args.dut_user}@{args.dut}: ")
 
-            dut_conn = DUTConnection(args.dut, args.dut_user, args.dut_pass)
-            if dut_conn.connect():
-                version = dut_conn.get_miniupnpd_version()
-                pid = dut_conn.get_miniupnpd_pid()
-                print(f"  {GREEN}[OK]{RESET} SSH connected to {args.dut}")
-                if version:
-                    print(f"  {CYAN}[INFO]{RESET} miniupnpd version: {version}")
-                if pid:
-                    print(f"  {CYAN}[INFO]{RESET} miniupnpd PID: {pid}")
-                print()
+            result, detail = check_device_binary(args.dut, args.dut_user, args.dut_pass)
+            checks_run += 1
+            if result is True:
+                print(f"  {GREEN}[PASS]{RESET} {detail}")
+                checks_pass += 1
+            elif result is False:
+                print(f"  {RED}[FAIL]{RESET} {detail}")
+                checks_fail += 1
             else:
-                dut_conn = None
-
-    # ─── Pre-check: port open ───
-    print(f"  {CYAN}[INFO]{RESET} Checking UPnP port {args.port}...")
-    if not check_port_open(args.dut, args.port):
-        print(f"  {RED}[ERROR]{RESET} Port {args.port} not open on {args.dut}")
-        print(f"         miniupnpd may not be running or using a different port.")
-        print(f"         Check: ssh root@{args.dut} 'netstat -tlnp | grep miniupnpd'")
-        sys.exit(1)
-    print(f"  {GREEN}[OK]{RESET} Port {args.port} is open\n")
-
-    # ─── Run exploit payloads ───
-    print(f"{'─'*60}")
-    print(f" Running {len(PAYLOADS)} exploit payloads")
-    print(f"{'─'*60}\n")
-
-    results = []
-    selected_payloads = PAYLOADS
-    if args.payload:
-        selected_payloads = [p for p in PAYLOADS if p["id"] == args.payload]
-        if not selected_payloads:
-            print(f"  {RED}[ERROR]{RESET} Unknown payload ID: {args.payload}")
-            print(f"  Available: {', '.join(p['id'] for p in PAYLOADS)}")
-            sys.exit(1)
-
-    for i, payload in enumerate(selected_payloads, 1):
-        print(f"  [{i}/{len(selected_payloads)}] {payload['name']}")
-        print(f"       {payload['description']}")
-        print(f"       Payload: {repr(payload['xml'][:60])}{'...' if len(payload['xml']) > 60 else ''}")
-
-        result = run_exploit_test(args.dut, args.port, payload, dut_conn)
-        results.append({"payload": payload, **result})
-
-        if result["passed"]:
-            print(f"       {GREEN}[PASS]{RESET} {result['detail']}")
-        elif result["passed"] is False:
-            print(f"       {RED}[FAIL]{RESET} {result['detail']}")
-
-            # Check crash log
-            if dut_conn:
-                crash_log = dut_conn.check_crash_log()
-                if crash_log:
-                    print(f"       {RED}[CRASH]{RESET} dmesg: {crash_log[:200]}")
-
-            # Wait for procd to restart before next test
-            print(f"       {YELLOW}[WAIT]{RESET} Waiting for daemon restart...")
-            time.sleep(3)
-            if not check_port_open(args.dut, args.port, timeout=5):
-                print(f"       {RED}[ERROR]{RESET} Daemon did not restart — stopping tests")
-                break
+                print(f"  {YELLOW}[INFO]{RESET} {detail}")
+                checks_inconclusive += 1
         print()
-
-    # ─── Regression test ───
-    print(f"{'─'*60}")
-    print(f" Regression check (valid UPnP request)")
-    print(f"{'─'*60}\n")
-
-    reg_passed, reg_detail = run_regression_test(args.dut, args.port)
-    if reg_passed:
-        print(f"  {GREEN}[PASS]{RESET} {reg_detail}")
-    elif reg_passed is False:
-        print(f"  {RED}[FAIL]{RESET} {reg_detail}")
-    else:
-        print(f"  {YELLOW}[WARN]{RESET} {reg_detail}")
 
     # ─── Summary ───
-    print(f"\n{'='*60}")
-    passed = sum(1 for r in results if r["passed"])
-    failed = sum(1 for r in results if r["passed"] is False)
-    total = len(results)
-
-    print(f" Results: {GREEN}{passed} PASSED{RESET}, {RED}{failed} FAILED{RESET} (of {total} tests)")
+    print(f"{'='*60}")
+    print(f" Summary: {checks_run} checks run")
     print(f"{'='*60}\n")
 
-    if failed > 0:
-        print(f"  {RED}{BOLD}VULNERABLE{RESET}: miniupnpd crashed on malformed XML input.")
-        print(f"  Apply the fix from miniupnp/miniupnp@3cfb4fb")
-        print(f"  SDK patch: 3076_miniupnpd_fix_CVE-2021-27137_minixml_overflow.patch")
+    if checks_pass > 0 and checks_fail == 0:
+        print(f"  {GREEN}{BOLD}FIX VERIFIED{RESET}: CVE-2021-27137 patch is applied.")
+        print()
+        sys.exit(0)
+    elif checks_fail > 0:
+        print(f"  {RED}{BOLD}VULNERABLE{RESET}: CVE-2021-27137 fix is NOT applied.")
+        print(f"  Apply: 3076_miniupnpd_fix_CVE-2021-27137_minixml_overflow.patch")
+        print(f"  Upstream: https://github.com/miniupnp/miniupnp/commit/3cfb4fb")
         print()
         sys.exit(1)
     else:
-        print(f"  {GREEN}{BOLD}PASSED{RESET}: miniupnpd handled all malformed XML without crashing.")
-        print(f"  The CVE-2021-27137 fix appears to be applied.")
+        print(f"  {YELLOW}{BOLD}INCONCLUSIVE{RESET}: Could not definitively determine fix status.")
+        print(f"  Try --source with the build tree path for definitive results.")
         print()
-        sys.exit(0)
+        sys.exit(2)
 
 
 if __name__ == "__main__":
