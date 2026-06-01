@@ -642,12 +642,13 @@ class CVETestRunner:
         self.dut_features["dhcp-script"] = "dhcp-script" in out or "dhcpscript" in out or "/" in out
 
         # Check for --add-subnet (needed for CVE-2026-4893)
+        # Only match actual config lines, not binary help text
         out, _, _ = self.dut.exec(
-            "cat /etc/dnsmasq.conf /var/etc/dnsmasq.conf* /tmp/dnsmasq.conf 2>/dev/null | grep add-subnet; "
-            "ps w | grep dnsmasq | grep add-subnet; "
-            "uci show dhcp 2>/dev/null | grep add.subnet"
+            "grep -s '^add-subnet' /etc/dnsmasq.conf /var/etc/dnsmasq.conf* /tmp/dnsmasq.conf 2>/dev/null; "
+            "ps w | grep dnsmasq | grep -v grep | grep -- '--add-subnet'; "
+            "uci show dhcp 2>/dev/null | grep 'add.subnet'"
         )
-        self.dut_features["add-subnet"] = "add-subnet" in out or "add_subnet" in out
+        self.dut_features["add-subnet"] = "add-subnet" in out
 
         # Version
         ver_line = version_info.split("\n")[0] if version_info else "unknown"
