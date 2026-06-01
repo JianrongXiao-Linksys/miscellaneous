@@ -126,11 +126,10 @@ read-only SSH access for state inspection.
 │   enx24f5a2f20603 (LAN)          enp0s31f6 (WAN)                   │
 │   192.168.1.254                   10.0.0.211                        │
 │        │                               │                            │
-│   ┌────┴──────────────┐               │                            │
-│   │ Malicious DNS     │               │   (not used for this test) │
-│   │ Server (port 53)  │               │                            │
-│   │ + DHCPv6 client   │               │                            │
-│   └────┬──────────────┘               │                            │
+│        │                          ┌────┴──────────────┐             │
+│        │                          │ Malicious DNS     │             │
+│        │                          │ Server (port 53)  │             │
+│        │                          └────┬──────────────┘             │
 │        │                               │                            │
 └────────┼───────────────────────────────┼────────────────────────────┘
          │ LAN (192.168.1.0/24)          │ WAN (10.0.0.0/24)
@@ -144,10 +143,17 @@ read-only SSH access for state inspection.
 │              dnsmasq 2.78 / 2.90                                    │
 │                                                                      │
 │   resolv-file=/etc/resolv.conf                                      │
-│   → nameserver 192.168.1.254  ← forwards queries to our server     │
+│   → nameserver 10.0.0.211  ← forwards queries to our server (WAN)  │
 │   dhcp-script=/etc/init.d/.../dnsmasq_dhcp.script                   │
 │                                                                      │
 └─────────────────────────────────────────────────────────────────────┘
+
+Data flow:
+  1. Tool sends DNS query to DUT (192.168.1.1:53) from LAN
+  2. DUT's dnsmasq can't resolve locally → forwards to upstream (10.0.0.211)
+  3. Our malicious server on WAN replies with exploit payload
+  4. DUT's dnsmasq processes the malicious response → crash/hang/survive
+  5. Tool checks DUT state via SSH (read-only)
 ```
 
 ### How It Works
@@ -159,16 +165,25 @@ read-only SSH access for state inspection.
 │ Start    │     │ Send DNS  │     │ SSH to DUT:      │     │ PASS:    │
 │ malicious│     │ query to  │     │ - pidof dnsmasq  │     │ survived │
 │ DNS srv  │     │ DUT→DUT   │     │ - PID changed?   │     │          │
-│ on laptop│     │ forwards  │     │ - dmesg crash?   │     │ FAIL:    │
-│          │     │ to us→we  │     │ - /var/log/msg   │     │ crashed/ │
-│ Config   │     │ reply w/  │     │                  │     │ hung     │
-│ DUT DNS  │     │ exploit   │     │ Liveness query   │     │          │
-│ upstream │     │ payload   │     │ (version.bind)   │     │          │
+│ on WAN   │     │ forwards  │     │ - dmesg crash?   │     │ FAIL:    │
+│ interface│     │ to us→we  │     │ - /var/log/msg   │     │ crashed/ │
+│ (10.0.0. │     │ reply w/  │     │                  │     │ hung     │
+│  211:53) │     │ exploit   │     │ Liveness query   │     │          │
+│          │     │ payload   │     │ (version.bind)   │     │          │
 └──────────┘     └───────────┘     └──────────────────┘     └──────────┘
+
+NOTE: Tool does NOT modify DUT settings. User must set DNS to 10.0.0.211 via GUI.
 ```
 
 ### Running the Tool
 
+**Step 1: Set DUT upstream DNS via GUI**
+- Open Router Admin (http://192.168.1.1 or http://myrouter.local)
+- Go to Internet/WAN Settings → DNS
+- Set Static DNS 1: `10.0.0.211`
+- Save/Apply
+
+**Step 2: Run the tool**
 ```bash
 # Full test — all 6 CVEs (requires sudo for port 53)
 sudo python3 dnsmasq_cve_verify.py
@@ -178,17 +193,14 @@ sudo python3 dnsmasq_cve_verify.py --cve CVE-2026-5172
 sudo python3 dnsmasq_cve_verify.py --cve CVE-2026-4892 --cve CVE-2026-5172
 
 # Custom DUT/laptop IPs
-sudo python3 dnsmasq_cve_verify.py --dut 192.168.1.1 --laptop 192.168.1.254
-
-# If DUT is already configured to forward DNS to this laptop
-sudo python3 dnsmasq_cve_verify.py --skip-setup
-
-# Non-root (uses high port — DUT must be manually configured to forward here)
-python3 dnsmasq_cve_verify.py --dns-port 5353 --skip-setup
+sudo python3 dnsmasq_cve_verify.py --dut 192.168.1.1 --laptop 10.0.0.211
 
 # Custom SSH credentials
 sudo python3 dnsmasq_cve_verify.py --dut-user admin --dut-pass mypassword
 ```
+
+**Step 3: Restore DUT DNS (after testing)**
+- Set DNS back to "Obtain from ISP automatically" via GUI
 
 ### Expected Results
 
@@ -226,13 +238,12 @@ All 6 CVEs → PASS
 
 | Flag | Default | Description |
 |------|---------|-------------|
-| `--dut` | 192.168.1.1 | DUT IP address |
-| `--laptop` | 192.168.1.254 | Laptop's LAN IP (binds DNS server here) |
+| `--dut` | 192.168.1.1 | DUT IP address (SSH + DNS queries sent here) |
+| `--laptop` | 10.0.0.211 | Laptop's WAN IP (binds malicious DNS server here) |
 | `--dut-user` | root | DUT SSH username |
 | `--dut-pass` | 12345Asdf@ | DUT SSH password |
 | `--dns-port` | 53 | Port for malicious DNS server |
 | `--cve` | all 6 | Specific CVE(s) to test (repeatable) |
-| `--skip-setup` | false | Skip DUT DNS configuration |
 
 ---
 

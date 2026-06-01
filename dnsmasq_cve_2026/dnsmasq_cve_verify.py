@@ -6,28 +6,34 @@ Runs on the testing laptop, sends attack packets to the DUT,
 and reports PASS/FAIL for each of 6 CVEs.
 
 Architecture:
-  - Laptop (192.168.1.254): runs this tool, simulates malicious DNS/DHCPv6
+  - Laptop (10.0.0.211): runs this tool on DUT's WAN subnet, acts as malicious DNS
   - DUT (192.168.1.1): target device running dnsmasq
   - SSH to DUT is read-only (check process state, logs, compile options)
+  - Tool does NOT modify DUT settings — user sets DNS via GUI
+
+Prerequisites:
+  1. Laptop connected to DUT's WAN subnet (e.g., 10.0.0.x)
+  2. User sets DUT upstream DNS to laptop IP via GUI
+     (Router Admin → Internet/WAN → DNS → Static: 10.0.0.211)
+  3. SSH access to DUT for read-only state inspection
 
 Lifecycle per CVE:
-  1. Environment Setup (start malicious server, configure DUT upstream)
-  2. Trigger (send attack packets through DUT to our server)
+  1. Environment Setup (start malicious DNS server on laptop)
+  2. Trigger (send DNS query to DUT → DUT forwards to us → we reply with exploit)
   3. State Inspection (SSH: pidof dnsmasq, dmesg, log check)
   4. Verdict (PASS = survived or feature not present, FAIL = crashed/hung)
-  5. Teardown (restore DUT config, stop servers)
+  5. Teardown (stop servers)
 
 Usage:
   sudo python3 dnsmasq_cve_verify.py
-  sudo python3 dnsmasq_cve_verify.py --dut 192.168.1.1 --laptop 192.168.1.254
+  sudo python3 dnsmasq_cve_verify.py --dut 192.168.1.1 --laptop 10.0.0.211
   sudo python3 dnsmasq_cve_verify.py --cve CVE-2026-5172
-  sudo python3 dnsmasq_cve_verify.py --skip-setup  # DUT already configured
 
 Requirements:
   - Root/sudo on laptop (to bind port 53)
   - paramiko (pip install paramiko)
-  - DUT reachable at --dut IP
-  - SSH credentials for DUT (default: root / 12345Asdf@)
+  - DUT reachable at --dut IP via SSH
+  - DUT DNS configured to forward to this laptop (set via GUI)
 """
 
 import argparse
@@ -177,32 +183,10 @@ class DUTConnection:
                   "|| dnsmasq 2>/dev/null")
         time.sleep(2)
 
-    def set_upstream_dns(self, server_ip, port=53):
-        """Configure DUT to use our server as upstream DNS.
-
-        Oak uses /sbin/syscfg for persistent config and writes /etc/resolv.conf
-        which dnsmasq reads via resolv-file=/etc/resolv.conf.
-        """
-        if port == 53:
-            server_str = server_ip
-        else:
-            server_str = f"{server_ip}#{port}"
-        # Set via syscfg (persists across dnsmasq restarts)
-        self.exec(f"/sbin/syscfg set dhcp_nameserver_1 {server_ip}")
-        self.exec(f"/sbin/syscfg set dhcp_nameserver_2 0.0.0.0")
-        self.exec(f"/sbin/syscfg set dhcp_nameserver_3 0.0.0.0")
-        # Also write directly to resolv.conf for immediate effect
-        self.exec(f'echo "nameserver {server_str}" > /etc/resolv.conf')
-        # Signal dnsmasq to re-read resolv.conf (SIGHUP)
-        self.exec("killall -HUP dnsmasq 2>/dev/null")
-
-    def restore_dns(self):
-        """Restore DUT DNS to defaults by regenerating resolv.conf."""
-        self.exec("/sbin/syscfg set dhcp_nameserver_1 0.0.0.0 2>/dev/null")
-        self.exec("/sbin/sysevent set wan_dynamic_dns '' 2>/dev/null")
-        # Trigger resolv.conf regeneration
-        self.exec(". /etc/init.d/resolver_functions.sh && prepare_resolver_conf 2>/dev/null")
-        self.exec("killall -HUP dnsmasq 2>/dev/null")
+    def verify_upstream_dns(self, expected_server):
+        """Check if DUT is configured to forward DNS to expected_server (read-only)."""
+        out, _, _ = self.exec("cat /etc/resolv.conf")
+        return expected_server in out
 
     def close(self):
         if self.client:
@@ -533,13 +517,12 @@ class MaliciousDNSServer:
 class CVETestRunner:
     """Orchestrates the full test lifecycle for each CVE."""
 
-    def __init__(self, dut_ip, laptop_ip, dut_user, dut_pass, dns_port=53, skip_setup=False):
+    def __init__(self, dut_ip, laptop_ip, dut_user, dut_pass, dns_port=53):
         self.dut_ip = dut_ip
         self.laptop_ip = laptop_ip
         self.dut_user = dut_user
         self.dut_pass = dut_pass
         self.dns_port = dns_port
-        self.skip_setup = skip_setup
         self.dut = None
         self.dns_server = None
         self.results = {}
@@ -582,24 +565,22 @@ class CVETestRunner:
             self.dut.close()
             return {cve: ("ERROR", str(e)) for cve in cves}
 
-        # Phase 2: Configure DUT upstream
-        if not self.skip_setup:
-            print(f"  {CYAN}[INIT]{RESET} Configuring DUT to forward DNS to {self.laptop_ip}...")
-            self.dut.set_upstream_dns(self.laptop_ip, self.dns_port)
-            time.sleep(2)
-            # Verify forwarding works
-            self.dns_server.set_exploit(None)
-            if not self._verify_forwarding():
-                print(f"  {YELLOW}[WARN]{RESET} DUT may not be forwarding to us. Trying restart...")
-                self.dut.restart_dnsmasq()
-                time.sleep(2)
-                self.dut.set_upstream_dns(self.laptop_ip, self.dns_port)
-                time.sleep(1)
-                if not self._verify_forwarding():
-                    print(f"  {RED}[ERROR]{RESET} DUT not forwarding queries to us.")
-                    print(f"         DNS server received: {self.dns_server.queries_received}")
+        # Phase 2: Verify DUT is forwarding to us (read-only check)
+        print(f"  {CYAN}[INIT]{RESET} Verifying DUT forwards DNS to {self.laptop_ip}...")
+        self.dns_server.set_exploit(None)
+        if self.dut.verify_upstream_dns(self.laptop_ip):
+            print(f"         → resolv.conf contains {self.laptop_ip} ✓")
         else:
-            print(f"  {CYAN}[INIT]{RESET} Skipping DUT setup (--skip-setup)")
+            print(f"  {YELLOW}[WARN]{RESET} DUT resolv.conf does not contain {self.laptop_ip}")
+            print(f"         Please set DNS server to {self.laptop_ip} via DUT GUI, then re-run.")
+
+        if not self._verify_forwarding():
+            print(f"  {RED}[ERROR]{RESET} DUT not forwarding queries to us.")
+            print(f"         Please configure DUT upstream DNS to {self.laptop_ip} via GUI.")
+            print(f"         (Router Admin → Internet/WAN Settings → DNS → Static: {self.laptop_ip})")
+            self.dns_server.stop()
+            self.dut.close()
+            return {cve: ("ERROR", f"DUT not forwarding to {self.laptop_ip}") for cve in cves}
 
         print(f"\n{'─' * 70}")
         print(f"  {BOLD}Running CVE Tests{RESET}\n")
@@ -610,9 +591,7 @@ class CVETestRunner:
 
         # Phase 4: Teardown
         print(f"\n{'─' * 70}")
-        print(f"  {CYAN}[TEARDOWN]{RESET} Restoring DUT configuration...")
-        if not self.skip_setup:
-            self.dut.restore_dns()
+        print(f"  {CYAN}[TEARDOWN]{RESET} Stopping services...")
         self.dns_server.stop()
         self.dut.close()
 
@@ -1095,11 +1074,16 @@ def main():
         description="dnsmasq CVE-2026 Automated Defect Verification Tool",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
+Prerequisites:
+  1. Connect laptop to DUT's WAN subnet (10.0.0.x)
+  2. Set DUT upstream DNS to this laptop's IP (10.0.0.211) via Router GUI
+     (Internet/WAN Settings → DNS → Static DNS 1: 10.0.0.211)
+  3. Run this tool
+
 Examples:
   sudo python3 dnsmasq_cve_verify.py
-  sudo python3 dnsmasq_cve_verify.py --dut 192.168.1.1 --laptop 192.168.1.254
+  sudo python3 dnsmasq_cve_verify.py --dut 192.168.1.1 --laptop 10.0.0.211
   sudo python3 dnsmasq_cve_verify.py --cve CVE-2026-5172 --cve CVE-2026-4892
-  sudo python3 dnsmasq_cve_verify.py --skip-setup  # DUT already points to us
 
 Pre-fix (vulnerable):  Expect FAIL for applicable CVEs
 Post-fix (patched):    Expect all PASS
@@ -1107,8 +1091,8 @@ Post-fix (patched):    Expect all PASS
     )
     parser.add_argument("--dut", default="192.168.1.1",
                         help="DUT IP address (default: 192.168.1.1)")
-    parser.add_argument("--laptop", default="192.168.1.254",
-                        help="This laptop's IP (default: 192.168.1.254)")
+    parser.add_argument("--laptop", default="10.0.0.211",
+                        help="This laptop's IP on DUT's WAN subnet (default: 10.0.0.211)")
     parser.add_argument("--dut-user", default="root",
                         help="DUT SSH username (default: root)")
     parser.add_argument("--dut-pass", default="12345Asdf@",
@@ -1117,8 +1101,6 @@ Post-fix (patched):    Expect all PASS
                         help="Port for malicious DNS server (default: 53)")
     parser.add_argument("--cve", action="append", dest="cves",
                         help="Specific CVE(s) to test (default: all 6)")
-    parser.add_argument("--skip-setup", action="store_true",
-                        help="Skip DUT configuration (already pointing to us)")
 
     args = parser.parse_args()
 
@@ -1145,7 +1127,6 @@ Post-fix (patched):    Expect all PASS
         dut_user=args.dut_user,
         dut_pass=args.dut_pass,
         dns_port=args.dns_port,
-        skip_setup=args.skip_setup,
     )
 
     results = runner.run_all(cves)
