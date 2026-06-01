@@ -186,38 +186,86 @@ so the DUT can reach the laptop as an upstream DNS server.
 NOTE: Tool does NOT modify DUT settings. User must set DNS to 10.0.0.211 via GUI.
 ```
 
-### Running the Tool
+### QA Test Procedure
 
-**Step 1: Connect laptop to DUT**
-- Laptop LAN port → DUT LAN (for SSH access and sending queries)
-- Laptop WAN port → DUT WAN subnet (for acting as upstream DNS)
+#### Prerequisites
 
-**Step 2: Set DUT upstream DNS via GUI**
-- Open Router Admin (e.g., http://192.168.1.1 or http://myrouter.local)
-- Go to Internet/WAN Settings → DNS
-- Set Static DNS 1 to your **laptop's WAN IP**
-- Save/Apply
+- Testing laptop with **two** network interfaces (LAN + WAN)
+- Python 3.6+ with `paramiko` installed (`pip install paramiko`)
+- SSH access to DUT (root credentials)
+- DUT admin GUI accessible
 
-**Step 3: Run the tool**
+#### Step 1: Physical Connection
+
+Connect the testing laptop to the DUT with two cables:
+
+| Laptop Port | Connects To | Purpose |
+|------------|-------------|---------|
+| LAN port | DUT LAN port | SSH access + send DNS queries to DUT |
+| WAN port | DUT WAN subnet (e.g., upstream switch/modem port) | Act as upstream DNS server |
+
+After connecting, note your laptop's IPs:
 ```bash
-# Full test — all 6 CVEs
-# --laptop = your laptop's WAN IP (the one DUT forwards DNS to)
-# --dut = DUT's LAN IP (the one you SSH to and send queries to)
-sudo python3 dnsmasq_cve_verify.py --laptop <YOUR_WAN_IP> --dut <DUT_LAN_IP>
-
-# Examples:
-sudo python3 dnsmasq_cve_verify.py --laptop 10.0.0.211 --dut 192.168.1.1
-sudo python3 dnsmasq_cve_verify.py --laptop 172.16.0.100 --dut 192.168.1.1
-
-# Test specific CVE(s)
-sudo python3 dnsmasq_cve_verify.py --laptop 10.0.0.211 --cve CVE-2026-5172
-
-# Custom SSH credentials
-sudo python3 dnsmasq_cve_verify.py --laptop 10.0.0.211 --dut-user admin --dut-pass mypass
+# Find your IPs
+ip addr show | grep "inet "
+# Example output:
+#   inet 192.168.1.254/24 ...  ← this is your LAN IP
+#   inet 10.0.0.211/24 ...     ← this is your WAN IP (use this for --laptop)
 ```
 
-**Step 4: Restore DUT DNS (after testing)**
-- Set DNS back to "Obtain from ISP automatically" via GUI
+#### Step 2: Set DUT DNS to Laptop via GUI
+
+1. Open a browser and go to the DUT admin page:
+   - Oak: `http://192.168.1.1` or `http://myrouter.local`
+   - Pinnacle: `http://192.168.1.1` or `http://myrouter.local`
+2. Log in with admin credentials
+3. Navigate to: **Connectivity** → **Internet Settings** → **Edit** (next to IPv4)
+4. Under **DNS**: select **Static DNS**
+5. Set **DNS 1** to your laptop's **WAN IP** (e.g., `10.0.0.211`)
+6. Click **Apply**
+7. Wait 5-10 seconds for settings to take effect
+
+#### Step 3: Run the Tool
+
+```bash
+cd ~/code/claude/miscellaneous/dnsmasq_cve_2026/
+
+# Run all 6 CVE tests:
+sudo python3 dnsmasq_cve_verify.py --laptop <YOUR_WAN_IP> --dut <DUT_LAN_IP> --dut-pass <SSH_PASSWORD>
+
+# Example:
+sudo python3 dnsmasq_cve_verify.py --laptop 10.0.0.211 --dut 192.168.1.1 --dut-pass '12345Asdf@'
+```
+
+The tool will:
+1. Connect to DUT via SSH (read-only)
+2. Start a malicious DNS server on your laptop's WAN IP
+3. Verify DUT is forwarding DNS queries to it
+4. Send exploit payloads for each CVE
+5. Check if dnsmasq crashed or hung
+6. Report PASS/FAIL per CVE
+
+#### Step 4: Read Results
+
+- **PASS** = DUT is safe (feature not active, or survived the attack)
+- **FAIL** = dnsmasq crashed or hung (vulnerable!)
+- **ERROR** = Could not connect or DUT not forwarding
+
+#### Step 5: Restore DUT DNS
+
+1. Go back to DUT admin GUI
+2. **Connectivity** → **Internet Settings** → **Edit**
+3. Under **DNS**: select **Automatic (from ISP)** or remove the static entry
+4. Click **Apply**
+
+#### Troubleshooting
+
+| Problem | Fix |
+|---------|-----|
+| "DUT not forwarding queries to us" | Verify Step 2 was done correctly. Check laptop WAN IP matches what you entered in GUI. |
+| "Cannot connect to DUT" | Verify SSH credentials. Try: `ssh root@192.168.1.1` manually. |
+| "Cannot bind port 53" | Run with `sudo`. Or use `--dns-port 5353` (requires manual DUT config). |
+| "Version: unknown" | DUT may not have dnsmasq in standard path. Tool still tests correctly. |
 
 ---
 
