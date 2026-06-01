@@ -25,15 +25,16 @@ Lifecycle per CVE:
   5. Teardown (stop servers)
 
 Usage:
-  sudo python3 dnsmasq_cve_verify.py
-  sudo python3 dnsmasq_cve_verify.py --dut 192.168.1.1 --laptop 10.0.0.211
-  sudo python3 dnsmasq_cve_verify.py --cve CVE-2026-5172
+  sudo python3 dnsmasq_cve_verify.py --laptop <YOUR_WAN_IP>
+  sudo python3 dnsmasq_cve_verify.py --laptop 10.0.0.211 --dut 192.168.1.1
+  sudo python3 dnsmasq_cve_verify.py --laptop 10.0.0.211 --cve CVE-2026-5172
 
 Requirements:
   - Root/sudo on laptop (to bind port 53)
   - paramiko (pip install paramiko)
+  - Laptop WAN interface on same subnet as DUT WAN
   - DUT reachable at --dut IP via SSH
-  - DUT DNS configured to forward to this laptop (set via GUI)
+  - DUT upstream DNS set to --laptop IP via GUI before running
 """
 
 import argparse
@@ -1075,28 +1076,28 @@ def main():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Prerequisites:
-  1. Connect laptop to DUT's WAN subnet (10.0.0.x)
-  2. Set DUT upstream DNS to this laptop's IP (10.0.0.211) via Router GUI
-     (Internet/WAN Settings → DNS → Static DNS 1: 10.0.0.211)
-  3. Run this tool
+  1. Connect laptop WAN port to same subnet as DUT's WAN
+  2. Set DUT upstream DNS to laptop's WAN IP via Router GUI
+     (Internet/WAN Settings → DNS → Static DNS 1: <LAPTOP_WAN_IP>)
+  3. Run this tool with --laptop <LAPTOP_WAN_IP>
 
 Examples:
-  sudo python3 dnsmasq_cve_verify.py
-  sudo python3 dnsmasq_cve_verify.py --dut 192.168.1.1 --laptop 10.0.0.211
-  sudo python3 dnsmasq_cve_verify.py --cve CVE-2026-5172 --cve CVE-2026-4892
+  sudo python3 dnsmasq_cve_verify.py --laptop 10.0.0.211
+  sudo python3 dnsmasq_cve_verify.py --laptop 10.0.0.211 --dut 192.168.1.1
+  sudo python3 dnsmasq_cve_verify.py --laptop 172.16.0.50 --cve CVE-2026-5172
 
 Pre-fix (vulnerable):  Expect FAIL for applicable CVEs
 Post-fix (patched):    Expect all PASS
 """,
     )
+    parser.add_argument("--laptop", required=True,
+                        help="This laptop's WAN IP (DUT forwards DNS here)")
     parser.add_argument("--dut", default="192.168.1.1",
-                        help="DUT IP address (default: 192.168.1.1)")
-    parser.add_argument("--laptop", default="10.0.0.211",
-                        help="This laptop's IP on DUT's WAN subnet (default: 10.0.0.211)")
+                        help="DUT's LAN IP (default: 192.168.1.1)")
     parser.add_argument("--dut-user", default="root",
                         help="DUT SSH username (default: root)")
-    parser.add_argument("--dut-pass", default="12345Asdf@",
-                        help="DUT SSH password")
+    parser.add_argument("--dut-pass", default=None,
+                        help="DUT SSH password (prompted if not provided)")
     parser.add_argument("--dns-port", type=int, default=53,
                         help="Port for malicious DNS server (default: 53)")
     parser.add_argument("--cve", action="append", dest="cves",
@@ -1114,6 +1115,11 @@ Post-fix (patched):    Expect all PASS
                 print(f"ERROR: Unknown CVE '{c}'. Valid: {', '.join(ALL_CVES)}")
                 sys.exit(1)
             cves.append(c_upper)
+
+    # Prompt for password if not provided
+    if not args.dut_pass:
+        import getpass
+        args.dut_pass = getpass.getpass(f"SSH password for {args.dut_user}@{args.dut}: ")
 
     # Check root
     if args.dns_port < 1024 and os.geteuid() != 0:

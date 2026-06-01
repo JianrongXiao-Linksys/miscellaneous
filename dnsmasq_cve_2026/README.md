@@ -123,8 +123,8 @@ read-only SSH access for state inspection.
 ┌─────────────────────────────────────────────────────────────────────┐
 │                        Testing Laptop                                │
 │                                                                      │
-│   enx24f5a2f20603 (LAN)          enp0s31f6 (WAN)                   │
-│   192.168.1.254                   10.0.0.211                        │
+│   LAN interface                   WAN interface                      │
+│   <LAPTOP_LAN_IP>                 <LAPTOP_WAN_IP>                   │
 │        │                               │                            │
 │        │                          ┌────┴──────────────┐             │
 │        │                          │ Malicious DNS     │             │
@@ -132,29 +132,40 @@ read-only SSH access for state inspection.
 │        │                          └────┬──────────────┘             │
 │        │                               │                            │
 └────────┼───────────────────────────────┼────────────────────────────┘
-         │ LAN (192.168.1.0/24)          │ WAN (10.0.0.0/24)
+         │ LAN subnet                    │ WAN subnet
          │                               │
 ┌────────┼───────────────────────────────┼────────────────────────────┐
 │        │                               │                            │
-│   br0: 192.168.1.1               eth4: 10.0.0.214                  │
+│   LAN: <DUT_LAN_IP>              WAN: <DUT_WAN_IP>                  │
 │   (LAN gateway)                   (WAN uplink)                      │
 │                                                                      │
-│              DUT (Oak / Pinnacle Router)                             │
-│              dnsmasq 2.78 / 2.90                                    │
+│              DUT (Oak or Pinnacle)                                   │
+│              dnsmasq 2.78 (Oak) / 2.90 (Pinnacle)                   │
 │                                                                      │
 │   resolv-file=/etc/resolv.conf                                      │
-│   → nameserver 10.0.0.211  ← forwards queries to our server (WAN)  │
-│   dhcp-script=/etc/init.d/.../dnsmasq_dhcp.script                   │
+│   → nameserver <LAPTOP_WAN_IP>  ← set via GUI, forwards to us      │
 │                                                                      │
 └─────────────────────────────────────────────────────────────────────┘
 
 Data flow:
-  1. Tool sends DNS query to DUT (192.168.1.1:53) from LAN
-  2. DUT's dnsmasq can't resolve locally → forwards to upstream (10.0.0.211)
-  3. Our malicious server on WAN replies with exploit payload
+  1. Tool sends DNS query to DUT LAN IP (port 53)
+  2. DUT's dnsmasq can't resolve locally → forwards upstream to LAPTOP_WAN_IP
+  3. Our malicious server on WAN interface replies with exploit payload
   4. DUT's dnsmasq processes the malicious response → crash/hang/survive
   5. Tool checks DUT state via SSH (read-only)
 ```
+
+**Example setup (your IPs will differ):**
+
+| Role | IP (example) |
+|------|--------------|
+| Laptop LAN | 192.168.1.254 |
+| Laptop WAN | 10.0.0.211 |
+| DUT LAN | 192.168.1.1 |
+| DUT WAN | 10.0.0.214 |
+
+The key requirement: **Laptop WAN IP and DUT WAN IP must be on the same subnet**,
+so the DUT can reach the laptop as an upstream DNS server.
 
 ### How It Works
 
@@ -177,29 +188,35 @@ NOTE: Tool does NOT modify DUT settings. User must set DNS to 10.0.0.211 via GUI
 
 ### Running the Tool
 
-**Step 1: Set DUT upstream DNS via GUI**
-- Open Router Admin (http://192.168.1.1 or http://myrouter.local)
+**Step 1: Connect laptop to DUT**
+- Laptop LAN port → DUT LAN (for SSH access and sending queries)
+- Laptop WAN port → DUT WAN subnet (for acting as upstream DNS)
+
+**Step 2: Set DUT upstream DNS via GUI**
+- Open Router Admin (e.g., http://192.168.1.1 or http://myrouter.local)
 - Go to Internet/WAN Settings → DNS
-- Set Static DNS 1: `10.0.0.211`
+- Set Static DNS 1 to your **laptop's WAN IP**
 - Save/Apply
 
-**Step 2: Run the tool**
+**Step 3: Run the tool**
 ```bash
-# Full test — all 6 CVEs (requires sudo for port 53)
-sudo python3 dnsmasq_cve_verify.py
+# Full test — all 6 CVEs
+# --laptop = your laptop's WAN IP (the one DUT forwards DNS to)
+# --dut = DUT's LAN IP (the one you SSH to and send queries to)
+sudo python3 dnsmasq_cve_verify.py --laptop <YOUR_WAN_IP> --dut <DUT_LAN_IP>
+
+# Examples:
+sudo python3 dnsmasq_cve_verify.py --laptop 10.0.0.211 --dut 192.168.1.1
+sudo python3 dnsmasq_cve_verify.py --laptop 172.16.0.100 --dut 192.168.1.1
 
 # Test specific CVE(s)
-sudo python3 dnsmasq_cve_verify.py --cve CVE-2026-5172
-sudo python3 dnsmasq_cve_verify.py --cve CVE-2026-4892 --cve CVE-2026-5172
-
-# Custom DUT/laptop IPs
-sudo python3 dnsmasq_cve_verify.py --dut 192.168.1.1 --laptop 10.0.0.211
+sudo python3 dnsmasq_cve_verify.py --laptop 10.0.0.211 --cve CVE-2026-5172
 
 # Custom SSH credentials
-sudo python3 dnsmasq_cve_verify.py --dut-user admin --dut-pass mypassword
+sudo python3 dnsmasq_cve_verify.py --laptop 10.0.0.211 --dut-user admin --dut-pass mypass
 ```
 
-**Step 3: Restore DUT DNS (after testing)**
+**Step 4: Restore DUT DNS (after testing)**
 - Set DNS back to "Obtain from ISP automatically" via GUI
 
 ### Expected Results
@@ -238,10 +255,10 @@ All 6 CVEs → PASS
 
 | Flag | Default | Description |
 |------|---------|-------------|
-| `--dut` | 192.168.1.1 | DUT IP address (SSH + DNS queries sent here) |
-| `--laptop` | 10.0.0.211 | Laptop's WAN IP (binds malicious DNS server here) |
+| `--laptop` | *(required)* | Laptop's WAN IP (binds malicious DNS server here) |
+| `--dut` | 192.168.1.1 | DUT's LAN IP (SSH + DNS queries sent here) |
 | `--dut-user` | root | DUT SSH username |
-| `--dut-pass` | 12345Asdf@ | DUT SSH password |
+| `--dut-pass` | *(prompted)* | DUT SSH password |
 | `--dns-port` | 53 | Port for malicious DNS server |
 | `--cve` | all 6 | Specific CVE(s) to test (repeatable) |
 
