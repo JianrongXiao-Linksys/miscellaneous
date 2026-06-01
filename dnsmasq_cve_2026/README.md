@@ -219,6 +219,58 @@ sudo python3 dnsmasq_cve_verify.py --laptop 10.0.0.211 --dut-user admin --dut-pa
 **Step 4: Restore DUT DNS (after testing)**
 - Set DNS back to "Obtain from ISP automatically" via GUI
 
+---
+
+## Test Results (2026-05-31)
+
+### Oak — dnsmasq 2.78 (OVERALL: PASS)
+
+```
+Compile options: IPv6 DHCP DHCPv6 no-DNSSEC
+```
+
+| CVE | Result | Reason |
+|-----|--------|--------|
+| CVE-2026-2291 | PASS | DNSSEC not compiled |
+| CVE-2026-4890 | PASS | DNSSEC not compiled |
+| CVE-2026-4891 | PASS | DNSSEC not compiled |
+| CVE-2026-4892 | PASS | dnsmasq not serving DHCPv6 (Oak uses dhcp6s for IPv6) |
+| CVE-2026-4893 | PASS | Logic bug only — no crash |
+| CVE-2026-5172 | PASS | Survived exploit (blockdata_expand path not in 2.78) |
+
+**Notes:**
+- Oak compiles DHCPv6 into dnsmasq but never configures it to serve DHCPv6.
+  IPv6 DHCP is handled by a separate binary (`/sbin/dhcp6s`, wide-dhcpv6).
+- No GUI setting can make dnsmasq handle DHCPv6 — CVE-2026-4892 is unreachable.
+- DNSSEC is not compiled (`no-DNSSEC`) — 3 CVEs are entirely unreachable.
+
+### Pinnacle — dnsmasq 2.90 (OVERALL: PASS)
+
+```
+Compile options: IPv6 DHCP no-DHCPv6 no-DNSSEC no-conntrack no-ipset no-auth no-cryptohash
+```
+
+| CVE | Result | Reason |
+|-----|--------|--------|
+| CVE-2026-2291 | PASS | DNSSEC not compiled |
+| CVE-2026-4890 | PASS | DNSSEC not compiled |
+| CVE-2026-4891 | PASS | DNSSEC not compiled |
+| CVE-2026-4892 | PASS | DHCPv6 not compiled |
+| CVE-2026-4893 | PASS | Logic bug only — no crash |
+| CVE-2026-5172 | PASS | Survived exploit variants |
+
+**Notes:**
+- Pinnacle uses `nodhcpv6` build variant (`-DNO_DHCP6`) — CVE-2026-4892 code doesn't exist in binary.
+- DNSSEC not compiled (`no-DNSSEC`, `no-cryptohash`) — 3 CVEs unreachable.
+- CVE-2026-5172 targets `extract_addresses()` but dnsmasq 2.90 validates rdlen before processing.
+
+### Conclusion
+
+Both platforms are **not practically exploitable** for any of the 6 CVEs in their
+production build configurations. The dangerous features (DNSSEC, DHCPv6-via-dnsmasq)
+are either not compiled or not configured. Patches are still recommended as
+defense-in-depth.
+
 ### Expected Results
 
 **Pre-fix (dnsmasq 2.78 on Oak):**
