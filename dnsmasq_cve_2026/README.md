@@ -111,29 +111,192 @@ python3 dnsmasq_cve_tester.py --binary /path/to/dnsmasq
   - `434d68f2` — CVE-2026-4893 (forward.c)
   - `fa3c8dde` — CVE-2026-5172 (rfc1035.c)
 
-## Verifying the Fix
+## Automated Defect Verification Tool (`dnsmasq_cve_verify.py`)
 
-After patching, re-run the tool to confirm:
+The primary QA tool. Runs on the **testing laptop**, sends attack packets to the DUT,
+and reports clear PASS/FAIL for each CVE. No modification of the DUT is needed beyond
+read-only SSH access for state inspection.
 
-```bash
-# Static analysis should show PATCHED for all CVEs
-python3 dnsmasq_cve_tester.py --source /path/to/patched-dnsmasq-source/
+### Network Topology
 
-# Network test should show dnsmasq survives all crafted packets
-python3 dnsmasq_cve_tester.py --target <device-ip-with-patched-firmware>
+```
+┌─────────────────────────────────────────────────────────────────────┐
+│                        Testing Laptop                                │
+│                                                                      │
+│   enx24f5a2f20603 (LAN)          enp0s31f6 (WAN)                   │
+│   192.168.1.254                   10.0.0.211                        │
+│        │                               │                            │
+│   ┌────┴──────────────┐               │                            │
+│   │ Malicious DNS     │               │   (not used for this test) │
+│   │ Server (port 53)  │               │                            │
+│   │ + DHCPv6 client   │               │                            │
+│   └────┬──────────────┘               │                            │
+│        │                               │                            │
+└────────┼───────────────────────────────┼────────────────────────────┘
+         │ LAN (192.168.1.0/24)          │ WAN (10.0.0.0/24)
+         │                               │
+┌────────┼───────────────────────────────┼────────────────────────────┐
+│        │                               │                            │
+│   br0: 192.168.1.1               eth4: 10.0.0.214                  │
+│   (LAN gateway)                   (WAN uplink)                      │
+│                                                                      │
+│              DUT (Oak / Pinnacle Router)                             │
+│              dnsmasq 2.78 / 2.90                                    │
+│                                                                      │
+│   resolv-file=/etc/resolv.conf                                      │
+│   → nameserver 192.168.1.254  ← forwards queries to our server     │
+│   dhcp-script=/etc/init.d/.../dnsmasq_dhcp.script                   │
+│                                                                      │
+└─────────────────────────────────────────────────────────────────────┘
 ```
 
-Expected output after successful patch:
-- Static analysis: all CVEs show `PATCHED` or `LIKELY PATCHED`
-- Network tests: dnsmasq remains responsive after all attack packets
-- Version check: reports version >= 2.92rel2
+### How It Works
 
-## Requirements
+```
+┌──────────┐     ┌───────────┐     ┌──────────────────┐     ┌──────────┐
+│  SETUP   │ ──► │  TRIGGER  │ ──► │  STATE INSPECT   │ ──► │  VERDICT │
+│          │     │           │     │                  │     │          │
+│ Start    │     │ Send DNS  │     │ SSH to DUT:      │     │ PASS:    │
+│ malicious│     │ query to  │     │ - pidof dnsmasq  │     │ survived │
+│ DNS srv  │     │ DUT→DUT   │     │ - PID changed?   │     │          │
+│ on laptop│     │ forwards  │     │ - dmesg crash?   │     │ FAIL:    │
+│          │     │ to us→we  │     │ - /var/log/msg   │     │ crashed/ │
+│ Config   │     │ reply w/  │     │                  │     │ hung     │
+│ DUT DNS  │     │ exploit   │     │ Liveness query   │     │          │
+│ upstream │     │ payload   │     │ (version.bind)   │     │          │
+└──────────┘     └───────────┘     └──────────────────┘     └──────────┘
+```
 
-- Python 3.6+ (standard library only — no pip dependencies)
-- Root/sudo for CVE-2026-4892 DHCPv6 test
-- IPv6 connectivity to target for DHCPv6 test
-- Network access to dnsmasq port 53 for DNS tests
+### Running the Tool
+
+```bash
+# Full test — all 6 CVEs (requires sudo for port 53)
+sudo python3 dnsmasq_cve_verify.py
+
+# Test specific CVE(s)
+sudo python3 dnsmasq_cve_verify.py --cve CVE-2026-5172
+sudo python3 dnsmasq_cve_verify.py --cve CVE-2026-4892 --cve CVE-2026-5172
+
+# Custom DUT/laptop IPs
+sudo python3 dnsmasq_cve_verify.py --dut 192.168.1.1 --laptop 192.168.1.254
+
+# If DUT is already configured to forward DNS to this laptop
+sudo python3 dnsmasq_cve_verify.py --skip-setup
+
+# Non-root (uses high port — DUT must be manually configured to forward here)
+python3 dnsmasq_cve_verify.py --dns-port 5353 --skip-setup
+
+# Custom SSH credentials
+sudo python3 dnsmasq_cve_verify.py --dut-user admin --dut-pass mypassword
+```
+
+### Expected Results
+
+**Pre-fix (dnsmasq 2.78 on Oak):**
+| CVE | Result | Reason |
+|-----|--------|--------|
+| CVE-2026-2291 | PASS | DNSSEC not compiled — not exploitable |
+| CVE-2026-4890 | PASS | DNSSEC not compiled — not exploitable |
+| CVE-2026-4891 | PASS | DNSSEC not compiled — not exploitable |
+| CVE-2026-4892 | PASS/FAIL | DHCPv6 compiled + dhcp-script active |
+| CVE-2026-4893 | PASS | Logic bug — no crash (version-based only) |
+| CVE-2026-5172 | PASS | blockdata_expand path not in 2.78 |
+
+**Pre-fix (dnsmasq 2.90 with DNSSEC on Pinnacle):**
+| CVE | Result | Reason |
+|-----|--------|--------|
+| CVE-2026-2291 | FAIL | Heap overflow via escaped names |
+| CVE-2026-4890 | FAIL | Infinite loop (hangs) |
+| CVE-2026-4891 | FAIL | RRSIG OOB read crash |
+| CVE-2026-4892 | PASS/FAIL | Depends on DHCPv6 + script config |
+| CVE-2026-4893 | PASS | Logic bug — no crash |
+| CVE-2026-5172 | FAIL | OOB read via falsified rdlen |
+
+**Post-fix (dnsmasq 2.92rel2 or backport patches applied):**
+All 6 CVEs → PASS
+
+### Requirements
+
+- Python 3.6+ with `paramiko` (`pip install paramiko`)
+- Root/sudo on laptop (to bind DNS on port 53)
+- SSH access to DUT (read-only — used for process state checks)
+- Laptop connected to DUT's LAN (192.168.1.x network)
+
+### Options Reference
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--dut` | 192.168.1.1 | DUT IP address |
+| `--laptop` | 192.168.1.254 | Laptop's LAN IP (binds DNS server here) |
+| `--dut-user` | root | DUT SSH username |
+| `--dut-pass` | 12345Asdf@ | DUT SSH password |
+| `--dns-port` | 53 | Port for malicious DNS server |
+| `--cve` | all 6 | Specific CVE(s) to test (repeatable) |
+| `--skip-setup` | false | Skip DUT DNS configuration |
+
+---
+
+## Other Tools
+
+### Remote Black-Box Tester (`test_dnsmasq_cve_remote.py`)
+
+Lightweight version check only — queries `version.bind` to determine if dnsmasq
+version is below the fix. No SSH, no setup, no exploit payloads.
+
+```bash
+python3 test_dnsmasq_cve_remote.py 192.168.1.1
+```
+
+### On-Device Script (`test_dnsmasq_cve_on_device.sh`)
+
+Runs directly on the DUT via SSH/serial. Checks binary version and compile options.
+
+```bash
+scp test_dnsmasq_cve_on_device.sh root@192.168.1.1:/tmp/
+ssh root@192.168.1.1 "sh /tmp/test_dnsmasq_cve_on_device.sh"
+```
+
+### Static Source Analyzer (`dnsmasq_cve_tester.py`)
+
+For developers — inspects source code for exact fix patterns.
+
+```bash
+python3 dnsmasq_cve_tester.py --source ~/code/.../dnsmasq-2.78/src/
+```
+
+### Malicious DNS Server (`malicious_dns_server.py`)
+
+Standalone exploit server for manual testing. Run it, point DUT's upstream DNS at it,
+then trigger queries to `crash-5172.evil.test`, `crash-2291.evil.test`, etc.
+
+```bash
+sudo python3 malicious_dns_server.py --port 53
+# Then on DUT: configure upstream → this host
+# Then trigger: dig @192.168.1.1 crash-5172.evil.test
+```
+
+---
+
+## Verifying the Fix
+
+After patching, re-run the automated tool:
+
+```bash
+# After applying patches and flashing firmware:
+sudo python3 dnsmasq_cve_verify.py
+
+# Expected: all 6 PASS
+```
+
+## Requirements Summary
+
+| Tool | Python | Root | SSH | Network |
+|------|--------|------|-----|---------|
+| `dnsmasq_cve_verify.py` | 3.6+ paramiko | Yes (port 53) | Yes (read-only) | LAN to DUT |
+| `test_dnsmasq_cve_remote.py` | 3.6+ stdlib | No | No | UDP 53 to DUT |
+| `test_dnsmasq_cve_on_device.sh` | N/A (shell) | No | Run on DUT | N/A |
+| `dnsmasq_cve_tester.py` | 3.6+ stdlib | No | No | Optional |
+| `malicious_dns_server.py` | 3.6+ stdlib | Yes (port 53) | No | DUT forwards to us |
 
 ## References
 
