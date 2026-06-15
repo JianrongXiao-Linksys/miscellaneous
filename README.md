@@ -11,6 +11,7 @@ A collection of utility scripts and tools for network device management, monitor
   - [Strip Sensitive Data](#strip-sensitive-data)
   - [CVE-2021-27137 miniupnpd Exploit Test](#cve-2021-27137-miniupnpd-exploit-test)
   - [CVE-2026 dnsmasq Vulnerability Tester](#cve-2026-dnsmasq-vulnerability-tester)
+  - [Network Stability Checker](#network-stability-checker)
 - [Installation](#installation)
 - [Requirements](#requirements)
 - [Contributing](#contributing)
@@ -40,6 +41,7 @@ Each tool is documented with its purpose, usage instructions, and technical deta
 | [CVE-2021-27137 Exploit Test](#cve-2021-27137-miniupnpd-exploit-test) | [`miniupnpd_cve_2021_27137/`](miniupnpd_cve_2021_27137/) | CVE-2021-27137 miniupnpd test suite (verify, exploit, on-device) |
 | [Strip Sensitive Data](#strip-sensitive-data) | [`strip-sensitive.py`](scripts/strip-sensitive.py) | Remove PII/secrets from code/logs before sharing with LLMs |
 | [CVE-2026 dnsmasq Tester](#cve-2026-dnsmasq-vulnerability-tester) | [`dnsmasq_cve_2026/dnsmasq_cve_tester.py`](dnsmasq_cve_2026/dnsmasq_cve_tester.py) | Network + static analysis test suite for 6 dnsmasq CVEs (May 2026) |
+| [Network Stability Checker](#network-stability-checker) | [`scripts/net_stability.py`](scripts/net_stability.py) | Test WiFi & Ethernet stability — latency, jitter, loss, DNS, throughput |
 
 ---
 
@@ -641,6 +643,150 @@ Path: /Users/[USER_REDACTED]/Desktop/project
 
 ---
 
+### Network Stability Checker
+
+**Script:** `scripts/net_stability.py`
+
+**Purpose:** Tests the stability of both WiFi and Ethernet connections on a Linux workstation and produces a comparative report with a scored recommendation.
+
+#### Description
+
+This tool runs a comprehensive battery of network stability tests on each interface (wired and wireless) and generates a scored report (0–100, graded A–F). It helps identify which connection is more reliable for tasks like video calls, remote SSH, or large transfers.
+
+#### Features
+
+- **Multi-interface**: Tests both WiFi and Ethernet simultaneously, compares results
+- **Latency profiling**: 20 ICMP pings × 3 targets (8.8.8.8, 1.1.1.1, 208.67.222.222)
+- **Jitter calculation**: Inter-packet delay variation across the ping series
+- **Packet loss**: Percentage of dropped packets per interface
+- **DNS resolution**: Timing and failure rate for 3 domain lookups
+- **Throughput**: Download speed test (1MB file from speedtest server)
+- **Stability scoring**: Weighted composite score with grade (A–F)
+- **JSON export**: Machine-readable `report.json` for automation/trending
+
+#### Technical Details
+
+| Aspect | Details |
+|--------|---------|
+| **Language** | Python 3.6+ |
+| **Dependencies** | None (standard library only) |
+| **External Tools** | `ping`, `dig`, `curl` (all standard on Linux) |
+| **Platform** | Linux (uses `-I` flag for interface binding) |
+| **Runtime** | ~60 seconds (tests both interfaces sequentially) |
+| **Output** | Terminal report + `report.json` |
+
+#### Scoring Algorithm
+
+| Factor | Weight | Threshold |
+|--------|--------|-----------|
+| Packet loss | -2.5 pts per 1% | Any loss penalized |
+| Latency | -0.1 to -0.2 pts/ms | >50ms penalized, >100ms heavy penalty |
+| Jitter | -0.2 to -0.5 pts/ms | >5ms penalized, >20ms heavy penalty |
+| DNS failures | -5 pts each | Any failure penalized |
+| DNS latency | -0.05 pts/ms | >200ms penalized |
+| Low throughput | -10 pts | <1 Mbps |
+
+**Grading:**
+- **A**: 90–100 (excellent, stable connection)
+- **B**: 75–89 (good, minor issues)
+- **C**: 60–74 (fair, noticeable instability)
+- **D**: 40–59 (poor, frequent issues)
+- **F**: 0–39 (unusable or down)
+
+#### Usage
+
+```bash
+# Run the checker
+python3 scripts/net_stability.py
+
+# Run from anywhere
+python3 ~/code/claude/miscellaneous/scripts/net_stability.py
+```
+
+#### Configuration
+
+Edit the constants at the top of the script to match your system:
+
+```python
+INTERFACES = {
+    "ethernet": "enp0s31f6",
+    "wifi": "wlp0s20f3",
+}
+
+PING_TARGETS = ["8.8.8.8", "1.1.1.1", "208.67.222.222"]
+PING_COUNT = 20
+DNS_TARGETS = ["google.com", "cloudflare.com", "github.com"]
+```
+
+To find your interface names: `ip -br link show`
+
+#### Example Output
+
+```
+════════════════════════════════════════════════════════════
+  NETWORK STABILITY REPORT — 2026-06-15 08:26:30
+════════════════════════════════════════════════════════════
+
+  ┌─ ETHERNET (enp0s31f6) — UP
+  │  IP: 10.0.0.211  Gateway: 10.0.0.1
+  │
+  │  Latency:    avg=17.1ms  min=9.0ms  max=28.4ms
+  │  Jitter:     2.2ms
+  │  Pkt Loss:   0.0%
+  │  DNS:        avg=70ms  failures=0/3
+  │  Throughput:  2.08 Mbps
+  │
+  └─ Grade: A (100/100)
+
+  ┌─ WIFI (wlp0s20f3) — UP
+  │  IP: 10.0.0.188  Gateway: 10.0.0.1
+  │
+  │  Latency:    avg=25.3ms  min=14.1ms  max=43.8ms
+  │  Jitter:     4.0ms
+  │  Pkt Loss:   0.0%
+  │  DNS:        avg=34ms  failures=0/3
+  │  Throughput:  1.75 Mbps
+  │
+  └─ Grade: A (100/100)
+
+  ★ Recommended: ethernet — score 100/100, avg latency 17.1ms, loss 0.0%
+```
+
+#### JSON Report Format
+
+```json
+{
+  "timestamp": "2026-06-15T08:26:30.123456",
+  "results": [
+    {
+      "name": "ethernet",
+      "interface": "enp0s31f6",
+      "link_up": true,
+      "ping_avg_ms": 17.1,
+      "jitter_ms": 2.2,
+      "ping_loss_pct": 0.0,
+      "stability_score": 100.0,
+      "grade": "A"
+    }
+  ]
+}
+```
+
+#### Use Cases
+
+1. **Choosing connections**: Determine whether WiFi or Ethernet is more stable for your workflow
+2. **Diagnosing intermittent issues**: Run periodically to catch degradation patterns
+3. **Before important calls**: Quick pre-meeting connectivity check
+4. **Network troubleshooting**: Identify whether issues are interface-specific or upstream
+
+#### Requirements
+
+- Linux with `ip`, `ping`, `dig`, `curl` commands
+- Both WiFi and Ethernet interfaces configured (script skips DOWN interfaces gracefully)
+- No root required (uses standard ICMP ping)
+
+---
+
 ## Installation
 
 ### Clone the Repository
@@ -753,7 +899,8 @@ miscellaneous/
 │   ├── wifistats_regdump.sh              # WiFi stats and register dump collection
 │   ├── Reg_dump.sh                        # 5GHz radio register dump diagnostic
 │   ├── strip-sensitive.py                 # PII/secrets stripping tool
-│   └── strip-sensitive-config.example.json # Example config for strip-sensitive
+│   ├── strip-sensitive-config.example.json # Example config for strip-sensitive
+│   └── net_stability.py                   # Network stability checker (WiFi vs Ethernet)
 ├── miniupnpd_cve_2021_27137/              # CVE-2021-27137 test suite (verify + exploit + on-device)
 ├── dnsmasq_cve_2026/                     # CVE-2026 dnsmasq vulnerability test suite
 │   ├── dnsmasq_cve_tester.py            # Main test tool (network + static analysis)
