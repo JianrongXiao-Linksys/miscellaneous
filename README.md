@@ -41,7 +41,7 @@ Each tool is documented with its purpose, usage instructions, and technical deta
 | [CVE-2021-27137 Exploit Test](#cve-2021-27137-miniupnpd-exploit-test) | [`miniupnpd_cve_2021_27137/`](miniupnpd_cve_2021_27137/) | CVE-2021-27137 miniupnpd test suite (verify, exploit, on-device) |
 | [Strip Sensitive Data](#strip-sensitive-data) | [`strip-sensitive.py`](scripts/strip-sensitive.py) | Remove PII/secrets from code/logs before sharing with LLMs |
 | [CVE-2026 dnsmasq Tester](#cve-2026-dnsmasq-vulnerability-tester) | [`dnsmasq_cve_2026/dnsmasq_cve_tester.py`](dnsmasq_cve_2026/dnsmasq_cve_tester.py) | Network + static analysis test suite for 6 dnsmasq CVEs (May 2026) |
-| [Network Stability Checker](#network-stability-checker) | [`scripts/net_stability.py`](scripts/net_stability.py) | Test WiFi & Ethernet stability — latency, jitter, loss, DNS, throughput |
+| [Network Stability Checker](#network-stability-checker) | [`scripts/net_stability.py`](scripts/net_stability.py) | Continuous ISP outage monitor — collects Cox SLA violation evidence |
 
 ---
 
@@ -647,22 +647,26 @@ Path: /Users/[USER_REDACTED]/Desktop/project
 
 **Script:** `scripts/net_stability.py`
 
-**Purpose:** Tests the stability of both WiFi and Ethernet connections on a Linux workstation and produces a comparative report with a scored recommendation.
+**Purpose:** Continuous ISP monitoring tool that collects outage evidence against Cox (or any ISP) by separating gateway reachability from internet connectivity. Tests both WiFi and Ethernet to conclusively prove ISP-side faults.
 
 #### Description
 
-This tool runs a comprehensive battery of network stability tests on each interface (wired and wireless) and generates a scored report (0–100, graded A–F). It helps identify which connection is more reliable for tasks like video calls, remote SSH, or large transfers.
+Designed specifically for documenting ISP outages and SLA violations. The tool separates "can I reach my router?" from "can I reach the internet?" — if the gateway is UP but internet is DOWN on both wired and wireless, the fault is conclusively in the ISP's network.
 
-#### Features
+Two modes:
+- **One-shot** (default): Quick diagnostic showing current state and fault location
+- **Monitor** (`--monitor`): Continuous daemon that logs every sample, detects outages, and generates an ISP complaint report
 
-- **Multi-interface**: Tests both WiFi and Ethernet simultaneously, compares results
-- **Latency profiling**: 20 ICMP pings × 3 targets (8.8.8.8, 1.1.1.1, 208.67.222.222)
-- **Jitter calculation**: Inter-packet delay variation across the ping series
-- **Packet loss**: Percentage of dropped packets per interface
-- **DNS resolution**: Timing and failure rate for 3 domain lookups
-- **Throughput**: Download speed test (1MB file from speedtest server)
-- **Stability scoring**: Weighted composite score with grade (A–F)
-- **JSON export**: Machine-readable `report.json` for automation/trending
+#### Key Design for ISP Evidence
+
+| Feature | Why It Matters for Cox Complaint |
+|---------|----------------------------------|
+| Gateway vs Internet separation | Proves fault is Cox, not your equipment |
+| Both interfaces tested simultaneously | Rules out NIC/cable problems |
+| Timestamped JSONL log | Proves exact outage start/end times |
+| Accelerated polling during outages (10s) | Precise duration measurement |
+| SLA comparison (99.9%) | Directly demonstrates contract violation |
+| Auto-generated Markdown report | Ready to submit to Cox support |
 
 #### Technical Details
 
@@ -672,117 +676,161 @@ This tool runs a comprehensive battery of network stability tests on each interf
 | **Dependencies** | None (standard library only) |
 | **External Tools** | `ping`, `dig`, `curl` (all standard on Linux) |
 | **Platform** | Linux (uses `-I` flag for interface binding) |
-| **Runtime** | ~60 seconds (tests both interfaces sequentially) |
-| **Output** | Terminal report + `report.json` |
+| **Log Location** | `~/cox-network-logs/` |
+| **Log Format** | JSONL (one JSON object per line per test cycle) |
+| **Poll Interval** | 60s normal, 10s during outage |
+| **Speed Test** | Every 5 minutes (not every cycle, to avoid saturating) |
 
-#### Scoring Algorithm
+#### Fault Location Logic
 
-| Factor | Weight | Threshold |
-|--------|--------|-----------|
-| Packet loss | -2.5 pts per 1% | Any loss penalized |
-| Latency | -0.1 to -0.2 pts/ms | >50ms penalized, >100ms heavy penalty |
-| Jitter | -0.2 to -0.5 pts/ms | >5ms penalized, >20ms heavy penalty |
-| DNS failures | -5 pts each | Any failure penalized |
-| DNS latency | -0.05 pts/ms | >200ms penalized |
-| Low throughput | -10 pts | <1 Mbps |
-
-**Grading:**
-- **A**: 90–100 (excellent, stable connection)
-- **B**: 75–89 (good, minor issues)
-- **C**: 60–74 (fair, noticeable instability)
-- **D**: 40–59 (poor, frequent issues)
-- **F**: 0–39 (unusable or down)
+```
+Link DOWN           → "local_nic" (your NIC/driver problem)
+Gateway unreachable → "local_network" (cable/WiFi/router LAN issue)
+Gateway OK + No Internet → "isp" (Cox's fault — KEY EVIDENCE)
+Gateway OK + >10% loss   → "isp_degraded" (Cox degraded service)
+All OK              → "ok"
+```
 
 #### Usage
 
-```bash
-# Run the checker
-python3 scripts/net_stability.py
+**One-shot diagnostic (quick check):**
 
-# Run from anywhere
-python3 ~/code/claude/miscellaneous/scripts/net_stability.py
+```bash
+python3 scripts/net_stability.py
+```
+
+**Continuous monitor mode (evidence collection):**
+
+```bash
+# Run in foreground
+python3 scripts/net_stability.py --monitor
+
+# Run in background
+nohup python3 scripts/net_stability.py --monitor > /dev/null 2>&1 &
+
+# Generate interim report without stopping monitor
+kill -USR1 $(pgrep -f "net_stability.*--monitor")
+
+# Generate report from existing logs (without running monitor)
+python3 scripts/net_stability.py --report
+```
+
+**Run as systemd service (survives reboot):**
+
+```bash
+# Create service file
+sudo tee /etc/systemd/system/cox-monitor.service << 'EOF'
+[Unit]
+Description=Cox Network Stability Monitor
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=jianrong
+ExecStart=/usr/bin/python3 /home/jianrong/code/claude/miscellaneous/scripts/net_stability.py --monitor
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+sudo systemctl daemon-reload
+sudo systemctl enable --now cox-monitor
 ```
 
 #### Configuration
 
-Edit the constants at the top of the script to match your system:
+Edit the constants at the top of the script:
 
 ```python
+GATEWAY = "10.0.0.1"            # Your Cox router IP
 INTERFACES = {
     "ethernet": "enp0s31f6",
     "wifi": "wlp0s20f3",
 }
-
-PING_TARGETS = ["8.8.8.8", "1.1.1.1", "208.67.222.222"]
-PING_COUNT = 20
-DNS_TARGETS = ["google.com", "cloudflare.com", "github.com"]
+POLL_INTERVAL_OK = 60           # Seconds between tests (normal)
+POLL_INTERVAL_OUTAGE = 10       # Seconds between tests (during outage)
+SPEED_TEST_INTERVAL = 300       # Speed test every 5 minutes
+COX_SLA_UPTIME = 99.9           # Cox advertised SLA
 ```
 
-To find your interface names: `ip -br link show`
+Find your interface names: `ip -br link show`
 
-#### Example Output
+#### Example Output (One-shot)
 
 ```
-════════════════════════════════════════════════════════════
-  NETWORK STABILITY REPORT — 2026-06-15 08:26:30
-════════════════════════════════════════════════════════════
+════════════════════════════════════════════════════════════════
+  Cox Network Stability Checker (one-shot)
+  Gateway: 10.0.0.1
+════════════════════════════════════════════════════════════════
 
   ┌─ ETHERNET (enp0s31f6) — UP
-  │  IP: 10.0.0.211  Gateway: 10.0.0.1
-  │
-  │  Latency:    avg=17.1ms  min=9.0ms  max=28.4ms
-  │  Jitter:     2.2ms
-  │  Pkt Loss:   0.0%
-  │  DNS:        avg=70ms  failures=0/3
-  │  Throughput:  2.08 Mbps
-  │
+  │  IP: 10.0.0.211
+  │  Gateway:   1.6ms (OK)
+  │  Internet:  avg=17.9ms  jitter=3.9ms  loss=0.0%
+  │  DNS:       avg=36ms  failures=0/3
+  │  Speed:     2.73 Mbps
+  │  Fault:     No issues
   └─ Grade: A (100/100)
 
   ┌─ WIFI (wlp0s20f3) — UP
-  │  IP: 10.0.0.188  Gateway: 10.0.0.1
-  │
-  │  Latency:    avg=25.3ms  min=14.1ms  max=43.8ms
-  │  Jitter:     4.0ms
-  │  Pkt Loss:   0.0%
-  │  DNS:        avg=34ms  failures=0/3
-  │  Throughput:  1.75 Mbps
-  │
+  │  IP: 10.0.0.188
+  │  Gateway:   14.1ms (OK)
+  │  Internet:  avg=27.5ms  jitter=5.7ms  loss=0.0%
+  │  DNS:       avg=37ms  failures=0/3
+  │  Speed:     2.00 Mbps
+  │  Fault:     No issues
   └─ Grade: A (100/100)
-
-  ★ Recommended: ethernet — score 100/100, avg latency 17.1ms, loss 0.0%
 ```
 
-#### JSON Report Format
+#### Example Output (Monitor Mode)
 
-```json
-{
-  "timestamp": "2026-06-15T08:26:30.123456",
-  "results": [
-    {
-      "name": "ethernet",
-      "interface": "enp0s31f6",
-      "link_up": true,
-      "ping_avg_ms": 17.1,
-      "jitter_ms": 2.2,
-      "ping_loss_pct": 0.0,
-      "stability_score": 100.0,
-      "grade": "A"
-    }
-  ]
-}
+```
+  [08:30:01] ethernet:OK 18ms | wifi:OK 25ms | uptime=99.85%
+  [08:31:01] ethernet:OK 17ms | wifi:OK 24ms | uptime=99.85%
+  [08:32:01] !! OUTAGE STARTED — Fault: ISP (Cox)
+             Gateway reachable: Yes
+             Internet: DOWN on all interfaces
+  [08:32:11] !! OUTAGE ONGOING — 10s — Fault: ISP (Cox)
+  [08:32:21] !! OUTAGE ONGOING — 20s — Fault: ISP (Cox)
+  [08:33:01] ✓ OUTAGE ENDED — duration: 60s
+  [08:34:01] ethernet:OK 19ms | wifi:OK 26ms | uptime=99.80%
+```
+
+#### Generated Report (for Cox Complaint)
+
+The tool generates `~/cox-network-logs/cox_complaint_report.md` containing:
+
+- Monitoring period and methodology
+- Uptime percentage vs Cox SLA (99.9%)
+- Complete outage log with timestamps and durations
+- Proof that fault was ISP-side (gateway reachable, internet dead, both interfaces)
+- Speed test results
+- Formal request for service credit
+
+#### Log Files
+
+```
+~/cox-network-logs/
+├── monitor.jsonl           # Every test sample (JSONL)
+├── outages.jsonl           # Detected outages with duration
+└── cox_complaint_report.md # Generated complaint report
 ```
 
 #### Use Cases
 
-1. **Choosing connections**: Determine whether WiFi or Ethernet is more stable for your workflow
-2. **Diagnosing intermittent issues**: Run periodically to catch degradation patterns
-3. **Before important calls**: Quick pre-meeting connectivity check
-4. **Network troubleshooting**: Identify whether issues are interface-specific or upstream
+1. **Cox outage evidence**: Run continuously to document SLA violations
+2. **Fault isolation**: Quickly determine if issue is your equipment or Cox
+3. **Service credit claims**: Generate formal report with timestamps
+4. **Technician visits**: Prove to Cox tech that outages are real and recurring
+5. **Pre-meeting check**: One-shot mode before important video calls
 
 #### Requirements
 
 - Linux with `ip`, `ping`, `dig`, `curl` commands
-- Both WiFi and Ethernet interfaces configured (script skips DOWN interfaces gracefully)
+- Both WiFi and Ethernet interfaces configured
 - No root required (uses standard ICMP ping)
 
 ---
