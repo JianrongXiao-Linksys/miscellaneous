@@ -6,6 +6,7 @@ A collection of utility scripts and tools for network device management, monitor
 
 - [Overview](#overview)
 - [Tools](#tools)
+  - [NowTV Multicast IPTV Test Suite](#nowtv-multicast-iptv-test-suite)
   - [WiFi Client Monitor](#wifi-client-monitor)
   - [Register Dump (5GHz Radio Debug)](#register-dump-5ghz-radio-debug)
   - [Strip Sensitive Data](#strip-sensitive-data)
@@ -36,12 +37,77 @@ Each tool is documented with its purpose, usage instructions, and technical deta
 
 | Tool | Script | Description |
 |------|--------|-------------|
+| [NowTV Multicast IPTV Test](#nowtv-multicast-iptv-test-suite) | [`nowtv_multicast_test/`](nowtv_multicast_test/) | IGMP proxy test suite for NowTV multicast IPTV (Issue #334) |
 | [WiFi Client Monitor](#wifi-client-monitor) | [`monitor_wifi_clients.sh`](scripts/monitor_wifi_clients.sh) | Monitor client associations on wireless interface |
 | [Register Dump](#register-dump-5ghz-radio-debug) | [`Reg_dump.sh`](scripts/Reg_dump.sh) | Capture MAC/PHY registers for 5GHz radio debugging |
 | [CVE-2021-27137 Exploit Test](#cve-2021-27137-miniupnpd-exploit-test) | [`miniupnpd_cve_2021_27137/`](miniupnpd_cve_2021_27137/) | CVE-2021-27137 miniupnpd test suite (verify, exploit, on-device) |
 | [Strip Sensitive Data](#strip-sensitive-data) | [`strip-sensitive.py`](scripts/strip-sensitive.py) | Remove PII/secrets from code/logs before sharing with LLMs |
 | [CVE-2026 dnsmasq Tester](#cve-2026-dnsmasq-vulnerability-tester) | [`dnsmasq_cve_2026/dnsmasq_cve_tester.py`](dnsmasq_cve_2026/dnsmasq_cve_tester.py) | Network + static analysis test suite for 6 dnsmasq CVEs (May 2026) |
 | [Network Stability Checker](#network-stability-checker) | [`scripts/net_stability.py`](scripts/net_stability.py) | Continuous ISP outage monitor — collects Cox SLA violation evidence |
+
+---
+
+### NowTV Multicast IPTV Test Suite
+
+**Directory:** [`nowtv_multicast_test/`](nowtv_multicast_test/) — Full test suite (see `nowtv_multicast_test/README.md` for details)
+
+**Purpose:** Automated test suite to validate igmpproxy multicast IPTV functionality on Pinnacle 2.0 PW (NowTV) customer build.
+
+**Related Issue:** [linksys/LinksysWRT#334](https://github.com/linksys/LinksysWRT/issues/334) — NowTV Multicast IPTV Feature
+
+#### Description
+
+Tests the full IGMP proxy multicast pipeline: join/leave relay, fast leave, multi-STB scenarios, channel switching, per-port snooping, ubus event notifications, and NAT coexistence. Simulates NowTV STB behavior using IGMPv2.
+
+#### Components
+
+| File | Purpose | Runs On |
+|------|---------|---------|
+| `run_tests.sh` | 12 automated test cases (20 assertions) | LAN PC (Ubuntu, sudo) |
+| `mcast_stb_sim.py` | STB simulator — join/leave/switch/multi/stress | LAN PC |
+| `mcast_source.py` | Multicast UDP source (simulates CDN headend) | WAN PC (Linux/Windows) |
+| `windows/mcast_source.py` | Windows-specific source with `--bind` support | WAN PC (Windows) |
+
+#### Test Topology
+
+```
+[WAN PC: mcast_source.py] --eth--> [DUT WAN port]
+[DUT LAN port] --eth--> [LAN PC: run_tests.sh + mcast_stb_sim.py]
+```
+
+#### Test Cases
+
+| TC | Test | Criteria |
+|----|------|----------|
+| 1 | igmpproxy service running | Service up, quickleave, upstream/downstream configured |
+| 2 | Kernel multicast routing | VIFs registered in `/proc/net/ip_mr_vif` |
+| 3 | Bridge IGMP snooping | Snooping disabled, IGMPv2 forced, querier enabled |
+| 4 | Single STB join & receive | MRT route created, packets forwarded |
+| 5 | Fast leave | Route removed after IGMPv2 leave |
+| 6 | Multi-STB same group | One STB leaves, other keeps stream |
+| 7 | Multiple channels | 3 simultaneous multicast groups |
+| 8 | Ubus event notification | Join/leave events via `ubus listen igmp.client` |
+| 9 | Channel switch | Leave old group + join new group |
+| 10 | Per-port snooping | MRT tracks correct output interfaces |
+| 11 | Fast leave timing | Leave-to-route-removal < 2000ms |
+| 12 | NAT coexistence | Internet works during active multicast |
+
+#### Usage
+
+```bash
+# On WAN PC (start multicast source)
+python3 mcast_source.py multi 239.1.1.1 239.1.1.2 239.1.1.3 --bind 10.0.0.100
+
+# On LAN PC (run test suite)
+sudo ./run_tests.sh 192.168.1.1 '12345Asdf@'
+```
+
+#### Requirements
+
+- DUT: Pinnacle 2.0 with PW customer firmware (igmpproxy enabled)
+- LAN PC: Ubuntu with Python 3, `sshpass`, root access
+- WAN PC: Any OS with Python 3 (connected to DUT WAN port)
+- DUT WAN must have IP connectivity to WAN PC (static or DHCP)
 
 ---
 
@@ -949,6 +1015,12 @@ miscellaneous/
 │   ├── strip-sensitive.py                 # PII/secrets stripping tool
 │   ├── strip-sensitive-config.example.json # Example config for strip-sensitive
 │   └── net_stability.py                   # Network stability checker (WiFi vs Ethernet)
+├── nowtv_multicast_test/                  # NowTV IGMP proxy multicast IPTV test suite
+│   ├── run_tests.sh                      # 12 automated test cases (20 assertions)
+│   ├── mcast_stb_sim.py                  # STB simulator (join/leave/switch/stress)
+│   ├── mcast_source.py                   # Multicast UDP source (Linux/Windows)
+│   ├── windows/mcast_source.py           # Windows-specific source with --bind
+│   └── README.md                         # Detailed usage documentation
 ├── miniupnpd_cve_2021_27137/              # CVE-2021-27137 test suite (verify + exploit + on-device)
 ├── dnsmasq_cve_2026/                     # CVE-2026 dnsmasq vulnerability test suite
 │   ├── dnsmasq_cve_tester.py            # Main test tool (network + static analysis)
