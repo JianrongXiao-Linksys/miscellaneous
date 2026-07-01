@@ -105,13 +105,24 @@ def send_igmp_leave(group_ip, iface=None):
         sys.exit(1)
 
 
+def get_iface_ip(iface):
+    """Get the IPv4 address of a network interface."""
+    import fcntl
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    return socket.inet_ntoa(fcntl.ioctl(s.fileno(), 0x8915,
+        struct.pack('256s', iface[:15].encode()))[20:24])
+
+
 def join_multicast_group(group_ip, port=5004, iface=None):
     """Join multicast group via socket (triggers kernel IGMP) and receive data."""
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_UDP)
     sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    if iface:
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_BINDTODEVICE, iface.encode())
     sock.bind(('', port))
 
-    mreq = struct.pack('4s4s', socket.inet_aton(group_ip), socket.inet_aton('0.0.0.0'))
+    local_ip = get_iface_ip(iface) if iface else '0.0.0.0'
+    mreq = struct.pack('4s4s', socket.inet_aton(group_ip), socket.inet_aton(local_ip))
     sock.setsockopt(socket.IPPROTO_IP, socket.IP_ADD_MEMBERSHIP, mreq)
     sock.settimeout(1.0)
 

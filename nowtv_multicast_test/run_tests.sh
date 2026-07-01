@@ -100,6 +100,9 @@ check_prereqs() {
     if [ -n "$LAN_IFACE" ]; then
         echo 2 > /proc/sys/net/ipv4/conf/${LAN_IFACE}/force_igmp_version 2>/dev/null
         log_info "Forced IGMPv2 on ${LAN_IFACE}"
+        IFACE_ARG="${LAN_IFACE}"
+    else
+        IFACE_ARG=""
     fi
 }
 
@@ -178,7 +181,7 @@ test_single_join() {
     log_info "Joining ${GROUP1} for 8 seconds..."
 
     # Join and keep running in background
-    python3 ${SCRIPT_DIR}/mcast_stb_sim.py join ${GROUP1} ${PORT} > /tmp/tc4_result.txt 2>&1 &
+    python3 ${SCRIPT_DIR}/mcast_stb_sim.py join ${GROUP1} ${PORT} ${IFACE_ARG} > /tmp/tc4_result.txt 2>&1 &
     PID=$!
     sleep 5
 
@@ -207,12 +210,12 @@ test_fast_leave() {
     echo "--- TC-5: Fast Leave ---"
     log_info "Join ${GROUP1}, then leave..."
 
-    python3 ${SCRIPT_DIR}/mcast_stb_sim.py join ${GROUP1} ${PORT} > /dev/null 2>&1 &
+    python3 ${SCRIPT_DIR}/mcast_stb_sim.py join ${GROUP1} ${PORT} ${IFACE_ARG} > /dev/null 2>&1 &
     PID=$!
     sleep 3
 
     # Leave
-    python3 ${SCRIPT_DIR}/mcast_stb_sim.py leave ${GROUP1}
+    python3 ${SCRIPT_DIR}/mcast_stb_sim.py leave ${GROUP1} ${IFACE_ARG}
     kill $PID 2>/dev/null; wait $PID 2>/dev/null
     sleep 2
 
@@ -231,18 +234,18 @@ test_multi_stb_same_group() {
     log_info "Two STBs join ${GROUP1}, one leaves, other should continue..."
 
     # STB-1 joins
-    python3 ${SCRIPT_DIR}/mcast_stb_sim.py join ${GROUP1} ${PORT} > /tmp/tc6_stb1.txt 2>&1 &
+    python3 ${SCRIPT_DIR}/mcast_stb_sim.py join ${GROUP1} ${PORT} ${IFACE_ARG} > /tmp/tc6_stb1.txt 2>&1 &
     STB1_PID=$!
     sleep 1
 
     # STB-2 joins (different port to avoid bind conflict on same PC)
-    python3 ${SCRIPT_DIR}/mcast_stb_sim.py join ${GROUP1} $((PORT+1)) > /tmp/tc6_stb2.txt 2>&1 &
+    python3 ${SCRIPT_DIR}/mcast_stb_sim.py join ${GROUP1} $((PORT+1)) ${IFACE_ARG} > /tmp/tc6_stb2.txt 2>&1 &
     STB2_PID=$!
     sleep 3
 
     # STB-1 sends IGMP leave (but STB-2 keeps socket open)
     log_info "STB-1 leaving ${GROUP1}..."
-    python3 ${SCRIPT_DIR}/mcast_stb_sim.py leave ${GROUP1}
+    python3 ${SCRIPT_DIR}/mcast_stb_sim.py leave ${GROUP1} ${IFACE_ARG}
     kill $STB1_PID 2>/dev/null; wait $STB1_PID 2>/dev/null
     sleep 1
 
@@ -254,7 +257,7 @@ test_multi_stb_same_group() {
     fi
 
     # Cleanup — leave and wait for route to fully clear before next test
-    python3 ${SCRIPT_DIR}/mcast_stb_sim.py leave ${GROUP1}
+    python3 ${SCRIPT_DIR}/mcast_stb_sim.py leave ${GROUP1} ${IFACE_ARG}
     kill $STB2_PID 2>/dev/null; wait $STB2_PID 2>/dev/null
     wait_route_clear "010101EF" 5
 }
@@ -265,13 +268,13 @@ test_multi_channel() {
     echo "--- TC-7: Multiple Different Channels ---"
     log_info "Joining 3 different groups..."
 
-    python3 ${SCRIPT_DIR}/mcast_stb_sim.py join ${GROUP1} 5004 > /dev/null 2>&1 &
+    python3 ${SCRIPT_DIR}/mcast_stb_sim.py join ${GROUP1} 5004 ${IFACE_ARG} > /dev/null 2>&1 &
     PID1=$!
     sleep 1
-    python3 ${SCRIPT_DIR}/mcast_stb_sim.py join ${GROUP2} 5005 > /dev/null 2>&1 &
+    python3 ${SCRIPT_DIR}/mcast_stb_sim.py join ${GROUP2} 5005 ${IFACE_ARG} > /dev/null 2>&1 &
     PID2=$!
     sleep 1
-    python3 ${SCRIPT_DIR}/mcast_stb_sim.py join ${GROUP3} 5006 > /dev/null 2>&1 &
+    python3 ${SCRIPT_DIR}/mcast_stb_sim.py join ${GROUP3} 5006 ${IFACE_ARG} > /dev/null 2>&1 &
     PID3=$!
     sleep 5
 
@@ -289,9 +292,9 @@ test_multi_channel() {
 
     # Cleanup — leave all groups and wait for routes to clear
     kill $PID1 $PID2 $PID3 2>/dev/null; wait $PID1 $PID2 $PID3 2>/dev/null
-    python3 ${SCRIPT_DIR}/mcast_stb_sim.py leave ${GROUP1}
-    python3 ${SCRIPT_DIR}/mcast_stb_sim.py leave ${GROUP2}
-    python3 ${SCRIPT_DIR}/mcast_stb_sim.py leave ${GROUP3}
+    python3 ${SCRIPT_DIR}/mcast_stb_sim.py leave ${GROUP1} ${IFACE_ARG}
+    python3 ${SCRIPT_DIR}/mcast_stb_sim.py leave ${GROUP2} ${IFACE_ARG}
+    python3 ${SCRIPT_DIR}/mcast_stb_sim.py leave ${GROUP3} ${IFACE_ARG}
     wait_route_clear "010101EF" 5
     wait_route_clear "020101EF" 5
     wait_route_clear "030101EF" 5
@@ -307,18 +310,18 @@ test_ubus_events() {
     sleep 4
 
     # First join — creates route (may be via cache-miss from WAN traffic)
-    python3 ${SCRIPT_DIR}/mcast_stb_sim.py join ${GROUP1} ${PORT} > /dev/null 2>&1 &
+    python3 ${SCRIPT_DIR}/mcast_stb_sim.py join ${GROUP1} ${PORT} ${IFACE_ARG} > /dev/null 2>&1 &
     PID=$!
     sleep 5
 
     # Second join on same group — triggers "update route" path in igmpproxy
     # This is where the ubus notification fires (existing route + new src)
-    python3 ${SCRIPT_DIR}/mcast_stb_sim.py join ${GROUP1} $((PORT+10)) > /dev/null 2>&1 &
+    python3 ${SCRIPT_DIR}/mcast_stb_sim.py join ${GROUP1} $((PORT+10)) ${IFACE_ARG} > /dev/null 2>&1 &
     PID2=$!
     sleep 5
 
     # Leave
-    python3 ${SCRIPT_DIR}/mcast_stb_sim.py leave ${GROUP1}
+    python3 ${SCRIPT_DIR}/mcast_stb_sim.py leave ${GROUP1} ${IFACE_ARG}
     sleep 2
     kill $PID $PID2 2>/dev/null; wait $PID $PID2 2>/dev/null
     sleep 2
@@ -347,7 +350,7 @@ test_channel_switch() {
     log_info "STB joins ${GROUP1}, then switches to ${GROUP2}..."
 
     # Join GROUP1
-    python3 ${SCRIPT_DIR}/mcast_stb_sim.py join ${GROUP1} ${PORT} > /tmp/tc9_stbA.txt 2>&1 &
+    python3 ${SCRIPT_DIR}/mcast_stb_sim.py join ${GROUP1} ${PORT} ${IFACE_ARG} > /tmp/tc9_stbA.txt 2>&1 &
     STBA_PID=$!
     sleep 3
 
@@ -359,10 +362,10 @@ test_channel_switch() {
     fi
 
     # Channel switch: leave GROUP1, immediately join GROUP2
-    python3 ${SCRIPT_DIR}/mcast_stb_sim.py leave ${GROUP1}
+    python3 ${SCRIPT_DIR}/mcast_stb_sim.py leave ${GROUP1} ${IFACE_ARG}
     kill $STBA_PID 2>/dev/null; wait $STBA_PID 2>/dev/null
     sleep 0.5
-    python3 ${SCRIPT_DIR}/mcast_stb_sim.py join ${GROUP2} $((PORT+2)) > /tmp/tc9_stbA2.txt 2>&1 &
+    python3 ${SCRIPT_DIR}/mcast_stb_sim.py join ${GROUP2} $((PORT+2)) ${IFACE_ARG} > /tmp/tc9_stbA2.txt 2>&1 &
     STBA2_PID=$!
     sleep 3
 
@@ -383,7 +386,7 @@ test_channel_switch() {
 
     # Cleanup — clear both groups before next test
     kill $STBA2_PID 2>/dev/null; wait $STBA2_PID 2>/dev/null
-    python3 ${SCRIPT_DIR}/mcast_stb_sim.py leave ${GROUP2}
+    python3 ${SCRIPT_DIR}/mcast_stb_sim.py leave ${GROUP2} ${IFACE_ARG}
     wait_route_clear "010101EF" 5
     wait_route_clear "020101EF" 5
 }
@@ -394,7 +397,7 @@ test_per_port_snooping() {
     echo "--- TC-10: Per-Port IGMP Snooping (Issue #334 Criteria #3) ---"
     log_info "Joining ${GROUP1} and checking bridge MDB for port-level tracking..."
 
-    python3 ${SCRIPT_DIR}/mcast_stb_sim.py join ${GROUP1} ${PORT} > /dev/null 2>&1 &
+    python3 ${SCRIPT_DIR}/mcast_stb_sim.py join ${GROUP1} ${PORT} ${IFACE_ARG} > /dev/null 2>&1 &
     PID=$!
     sleep 3
 
@@ -421,13 +424,13 @@ test_fast_leave_timing() {
     echo "--- TC-11: Fast Leave Timing (Issue #334 Criteria #4) ---"
     log_info "Measuring leave-to-route-removal latency..."
 
-    python3 ${SCRIPT_DIR}/mcast_stb_sim.py join ${GROUP1} ${PORT} > /dev/null 2>&1 &
+    python3 ${SCRIPT_DIR}/mcast_stb_sim.py join ${GROUP1} ${PORT} ${IFACE_ARG} > /dev/null 2>&1 &
     PID=$!
     sleep 3
 
     # Record time, send leave, measure until route disappears
     START_MS=$(date +%s%3N)
-    python3 ${SCRIPT_DIR}/mcast_stb_sim.py leave ${GROUP1}
+    python3 ${SCRIPT_DIR}/mcast_stb_sim.py leave ${GROUP1} ${IFACE_ARG}
     kill $PID 2>/dev/null; wait $PID 2>/dev/null
 
     for i in $(seq 1 20); do
@@ -453,7 +456,7 @@ test_nat_coexistence() {
     log_info "Checking regular internet access while multicast is active..."
 
     # Join multicast
-    python3 ${SCRIPT_DIR}/mcast_stb_sim.py join ${GROUP1} ${PORT} > /dev/null 2>&1 &
+    python3 ${SCRIPT_DIR}/mcast_stb_sim.py join ${GROUP1} ${PORT} ${IFACE_ARG} > /dev/null 2>&1 &
     PID=$!
     sleep 2
 
@@ -469,7 +472,7 @@ test_nat_coexistence() {
         fi
     fi
 
-    python3 ${SCRIPT_DIR}/mcast_stb_sim.py leave ${GROUP1}
+    python3 ${SCRIPT_DIR}/mcast_stb_sim.py leave ${GROUP1} ${IFACE_ARG}
     kill $PID 2>/dev/null; wait $PID 2>/dev/null
 }
 
