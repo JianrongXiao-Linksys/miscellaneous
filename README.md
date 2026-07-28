@@ -13,6 +13,7 @@ A collection of utility scripts and tools for network device management, monitor
   - [CVE-2021-27137 miniupnpd Exploit Test](#cve-2021-27137-miniupnpd-exploit-test)
   - [CVE-2026 dnsmasq Vulnerability Tester](#cve-2026-dnsmasq-vulnerability-tester)
   - [Network Stability Checker](#network-stability-checker)
+  - [Web GUI Factory-Reset Test (Issue #451)](#web-gui-factory-reset-test-issue-451)
 - [Installation](#installation)
 - [Requirements](#requirements)
 - [Contributing](#contributing)
@@ -44,6 +45,7 @@ Each tool is documented with its purpose, usage instructions, and technical deta
 | [Strip Sensitive Data](#strip-sensitive-data) | [`strip-sensitive.py`](scripts/strip-sensitive.py) | Remove PII/secrets from code/logs before sharing with LLMs |
 | [CVE-2026 dnsmasq Tester](#cve-2026-dnsmasq-vulnerability-tester) | [`dnsmasq_cve_2026/dnsmasq_cve_tester.py`](dnsmasq_cve_2026/dnsmasq_cve_tester.py) | Network + static analysis test suite for 6 dnsmasq CVEs (May 2026) |
 | [Network Stability Checker](#network-stability-checker) | [`scripts/net_stability.py`](scripts/net_stability.py) | Continuous ISP outage monitor — collects Cox SLA violation evidence |
+| [Web GUI Factory-Reset Test](#web-gui-factory-reset-test-issue-451) | [`web_gui_factory_reset_test/`](web_gui_factory_reset_test/) | Reproduce/diagnose #451 — web GUI refused after repeated factory resets |
 
 ---
 
@@ -901,6 +903,67 @@ The tool generates `~/cox-network-logs/cox_complaint_report.md` containing:
 
 ---
 
+### Web GUI Factory-Reset Test (Issue #451)
+
+**Directory:** [`web_gui_factory_reset_test/`](web_gui_factory_reset_test/) — Full tool + root-cause writeup (see `web_gui_factory_reset_test/README.md` for details)
+
+**Purpose:** Reproduce and diagnose the intermittent failure where the DUT web GUI becomes unreachable ("Connection Refused") after repeated factory resets, while the device still responds to ping.
+
+**Related Issue:** [linksys/LinksysWRT#451](https://github.com/linksys/LinksysWRT/issues/451) — [M60PW] Sometimes web GUI is not accessible after DUT is reset to default
+
+#### Description
+
+With the LAN cable kept connected and **no power cycle**, the tool repeatedly triggers a JNAP `core/FactoryReset` and, after each reboot, verifies both ping and the web UI (`:443`/`:80`). Typically around the 4th–5th consecutive reset the web UI is refused while ping still works. On failure the tool SSHes in and captures the smoking-gun state.
+
+#### Root Cause (confirmed against `pinnacle/develop`)
+
+`lighttpd` (the web server) is **not enabled at boot** — there is no `rc.d` `S*` symlink. Its only start trigger is the one-shot LAN-ifup hotplug `/etc/hotplug.d/iface/50-lighttpd`. If that single start is missed/fails on a boot, nothing re-triggers it until the next LAN ifup — which only a power cycle provides. Ping keeps working because ICMP is kernel-side. `curl`/JNAP cannot self-recover (they all talk to the dead lighttpd).
+
+**Proper fix:** enable lighttpd at boot (ship the `rc.d` enable symlink) and/or make `50-lighttpd` idempotent with a retry independent of a single ifup event.
+
+#### What It Does
+
+1. Baseline: confirm ping + web are up.
+2. Trigger JNAP `core/FactoryReset` (adaptive auth: master pw / `admin` / no-auth across https+http; SSH `jffs2reset` fallback).
+3. Wait for reboot and pingability.
+4. SSH-gate on Auto_Master completion (so "web loads properly" is judged fairly).
+5. Verify ping + web; log lighttpd process/socket state every iteration.
+6. Repeat **without power cycle** until web fails or N iterations pass.
+
+On web-refused it captures `logs/diag_*.txt` (lighttpd status, process list, listening sockets, config validation, missing `error.log`, absent boot symlink, hotplug logread); with `--recover` it runs `/etc/init.d/lighttpd start` to confirm the web comes straight back.
+
+#### Usage
+
+```bash
+cd web_gui_factory_reset_test
+
+# 15 resets, SSH diagnostics + recovery on failure.
+# -p sets BOTH the SSH login password and the JNAP basic-auth password.
+./reset_web_test.sh -i 192.168.1.1 -p '8xPghzqdr@' -n 15 --recover
+```
+
+| Option | Meaning | Default |
+|--------|---------|---------|
+| `-i IP` | DUT IP | `192.168.1.1` |
+| `-p PASS` | SSH + JNAP master password | `8xPghzqdr@` |
+| `-P PASS` | JNAP password only (override `-p`) | — |
+| `-u USER` | SSH user | `root` |
+| `-n N` | iterations | `15` |
+| `-w SECONDS` | max boot wait | `180` |
+| `-t SECONDS` | web reach timeout after ping | `90` |
+| `-a SECONDS` | max Auto_Master completion wait | `240` |
+| `--recover` | on failure, `/etc/init.d/lighttpd start` to confirm recovery | off |
+| `--no-ssh` | skip SSH gating/diagnostics (repro only) | off |
+
+Exit code `1` = bug reproduced (or DUT unreachable); `0` = all N resets recovered.
+
+#### Requirements
+
+- `sshpass`, `curl`, `ping` on the host
+- SSH + JNAP access to the DUT
+
+---
+
 ## Installation
 
 ### Clone the Repository
@@ -1025,6 +1088,9 @@ miscellaneous/
 ├── dnsmasq_cve_2026/                     # CVE-2026 dnsmasq vulnerability test suite
 │   ├── dnsmasq_cve_tester.py            # Main test tool (network + static analysis)
 │   └── README.md                         # Detailed usage documentation
+├── web_gui_factory_reset_test/            # Issue #451 web-GUI-after-factory-reset repro/diagnosis
+│   ├── reset_web_test.sh                 # Reset loop + ping/web verify + lighttpd diagnostics
+│   └── README.md                         # Root-cause writeup + usage
 └── (future tools...)
 ```
 
