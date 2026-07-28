@@ -99,47 +99,70 @@ dut_ssh() {
 }
 have_ssh() { [ "$USE_SSH" -eq 1 ] && [ -n "$SSH_PASS" ]; }
 
+# Log lighttpd's actual state EVERY iteration (per request): is the process
+# running and are :80/:443 listening? This is the crux of #451 — in the failure
+# state (a7c550a6) lighttpd was NOT running and 80/443 were not LISTEN even though
+# ping worked. Logging it every pass proves the correlation (up when web passes,
+# absent when web is refused). Echoes a one-line summary; returns 0 if running.
+log_lighttpd_state() {
+	local tag="$1"
+	have_ssh || { log "  [$tag] lighttpd-state: (no SSH)"; return 0; }
+	local proc listen st
+	proc=$(dut_ssh "ps w 2>/dev/null | grep -v grep | grep -c lighttpd" | tr -d '\r\n')
+	listen=$(dut_ssh "netstat -ltn 2>/dev/null | grep -Ec ':80 |:443 '" | tr -d '\r\n')
+	st=$(dut_ssh "/etc/init.d/lighttpd status 2>&1 | head -1" | tr -d '\r\n')
+	proc=${proc:-0}; listen=${listen:-0}
+	if [ "$proc" -gt 0 ] 2>/dev/null && [ "$listen" -gt 0 ] 2>/dev/null; then
+		log "  [$tag] lighttpd: RUNNING (proc=$proc, listen80/443=$listen, status='${st}')"
+		return 0
+	fi
+	bad "  [$tag] lighttpd: NOT RUNNING (proc=$proc, listen80/443=$listen, status='${st}')"
+	return 1
+}
+
 # JNAP result is OK only if it contains "OK". A response with _ErrorUnauthorized
 # (wrong/missing auth) or any _Error* must NOT be treated as success.
 jnap_result_ok() {
 	echo "$1" | grep -q '"result"[[:space:]]*:[[:space:]]*"OK"'
 }
 
-# One JNAP FactoryReset POST with basic auth, on the given scheme. Echoes body.
+# One JNAP FactoryReset POST on the given scheme with the given password.
+# An empty password sends NO auth header (unconfigured mode accepts that).
 jnap_factory_reset() {
-	local scheme="$1" insecure=""
+	local scheme="$1" pass="$2" insecure="" authhdr=()
 	[ "$scheme" = "https" ] && insecure="-k"
-	local auth
-	auth=$(printf '%s:%s' "$JNAP_USER" "$JNAP_PASS" | base64 | tr -d '\n')
+	if [ -n "$pass" ]; then
+		local auth
+		auth=$(printf '%s:%s' "$JNAP_USER" "$pass" | base64 | tr -d '\n')
+		authhdr=(-H "X-JNAP-Authorization: Basic $auth")
+	fi
 	curl -s $insecure -m 12 -X POST \
 		-H "Content-Type: application/json" \
 		-H "X-JNAP-Action: $JNAP_ACTION" \
-		-H "X-JNAP-Authorization: Basic $auth" \
+		"${authhdr[@]}" \
 		-d '{}' "$scheme://$DUT_IP/JNAP/" 2>&1
 }
 
-# trigger factory reset via JNAP (preferred: exactly what the issue uses).
-# Master mode requires HTTP basic auth (admin:$JNAP_PASS). Falls back to SSH
-# `jffs2reset -y && reboot` only if JNAP cannot be delivered/accepted.
+# trigger factory reset via JNAP (exactly what the issue uses).
+# The web-login password changes with device state: it is the master passphrase
+# in master mode but reverts to "admin" while unconfigured, and JNAP needs NO auth
+# at all when unconfigured. So we try, in order: master pw, "admin", then no-auth,
+# across https then http, and accept the first "result":"OK". SSH jffs2reset is the
+# last-resort fallback.
 trigger_factory_reset() {
-	local out
-	out=$(jnap_factory_reset https)
-	if jnap_result_ok "$out"; then
-		log "  JNAP FactoryReset accepted (https): $(echo "$out" | head -c 120)"
-		return 0
-	fi
-	log "  https JNAP not OK ($(echo "$out" | head -c 100)); trying http :80"
-	out=$(jnap_factory_reset http)
-	if jnap_result_ok "$out"; then
-		log "  JNAP FactoryReset accepted (http): $(echo "$out" | head -c 120)"
-		return 0
-	fi
-	# If it came back _ErrorUnauthorized, the password is wrong — surface it clearly.
-	if echo "$out" | grep -qi 'Unauthorized'; then
-		bad "  JNAP returned Unauthorized — check -p/-P password (expected master pw '$JNAP_PASS')."
-	fi
+	local out scheme pass
+	for scheme in https http; do
+		for pass in "$JNAP_PASS" "admin" ""; do
+			out=$(jnap_factory_reset "$scheme" "$pass")
+			if jnap_result_ok "$out"; then
+				log "  JNAP FactoryReset accepted ($scheme, pw='${pass:-<none>}'): $(echo "$out" | tr -d '\n' | head -c 120)"
+				return 0
+			fi
+		done
+	done
+	log "  ${C_YEL}JNAP not accepted on any scheme/password. Last: $(echo "$out" | tr -d '\n' | head -c 100)${C_RST}"
 	if have_ssh; then
-		log "  ${C_YEL}JNAP not accepted; falling back to SSH jffs2reset${C_RST}"
+		log "  ${C_YEL}Falling back to SSH jffs2reset${C_RST}"
 		dut_ssh "jffs2reset -y >/dev/null 2>&1; (sleep 1; reboot) &" >/dev/null 2>&1
 		return 0
 	fi
@@ -189,24 +212,33 @@ wait_auto_master() {
 		sleep "$AM_TIMEOUT"
 		return 0
 	fi
-	local waited=0 mode st pw
+	local waited=0 mode st pw pwset
 	while [ "$waited" -lt "$AM_TIMEOUT" ]; do
-		mode=$(dut_ssh "uci -q get linksys.smart_mode.mode" | tr -d '\r\n')
-		st=$(dut_ssh   "sysevent get auto_master::status" | tr -d '\r\n')
-		pw=$(dut_ssh   "uci -q get lsadmin.user.password" | tr -d '\r\n')
-		# Complete when: node became master (mode!=0) AND auto-master no longer
-		# running (stopped/failed) AND the admin password is no longer the default
-		# "admin" (i.e. default_passphrase applied — matches our JNAP/SSH creds).
+		mode=$(dut_ssh  "uci -q get linksys.smart_mode.mode" | tr -d '\r\n')
+		st=$(dut_ssh    "sysevent get auto_master::status" | tr -d '\r\n')
+		pw=$(dut_ssh    "uci -q get lsadmin.user.password" | tr -d '\r\n')
+		pwset=$(dut_ssh "uci -q get lsadmin.user.user_set_password" | tr -d '\r\n')
+		# Completion signals (verified on M60CF-EU, mode=2 / pw applied / status blank):
+		#   - node became master:            mode != 0   (usually 2)
+		#   - auto-master no longer running:  status is NOT "running"
+		#     (it may be "stopped", "failed", OR blank once the event settles)
+		#   - default passphrase applied:     user_set_password=1 AND pw != "admin"
 		if [ -n "$mode" ] && [ "$mode" != "0" ] \
-		   && { [ "$st" = "stopped" ] || [ "$st" = "failed" ]; } \
-		   && [ -n "$pw" ] && [ "$pw" != "admin" ]; then
-			ok "  Auto_Master complete after ~${waited}s (mode=$mode status=$st, admin pw applied)"
+		   && [ "$st" != "running" ] \
+		   && [ "$pwset" = "1" ] && [ -n "$pw" ] && [ "$pw" != "admin" ]; then
+			ok "  Auto_Master complete after ~${waited}s (mode=$mode status='${st:-<blank>}', admin pw applied)"
 			return 0
 		fi
-		log "  waiting auto-master... (${waited}s: mode='${mode:-?}' status='${st:-?}' pw_set=$([ "$pw" != admin ] && [ -n "$pw" ] && echo yes || echo no))"
+		# Stable terminal outcome that will NOT progress further: auto-master gave up
+		# ('failed') and the unit stayed unconfigured. Don't burn the whole timeout.
+		if [ "$st" = "failed" ] && [ "$mode" = "0" ] && [ "$waited" -ge 24 ]; then
+			log "  auto-master settled 'failed', unit still unconfigured (mode=0) after ~${waited}s"
+			return 1
+		fi
+		log "  waiting auto-master... (${waited}s: mode='${mode:-?}' status='${st:-<blank>}' pw_set='${pwset:-0}')"
 		sleep 6; waited=$((waited+6))
 	done
-	bad "  Auto_Master did not complete within ${AM_TIMEOUT}s (mode='${mode:-?}' status='${st:-?}')"
+	bad "  Auto_Master did not complete within ${AM_TIMEOUT}s (mode='${mode:-?}' status='${st:-<blank>}' pw_set='${pwset:-0}')"
 	return 1
 }
 
@@ -304,16 +336,13 @@ for i in $(seq 1 "$ITERATIONS"); do
 	# ping check (issue step 3: expected always OK — ICMP is kernel-side)
 	if ping_ok; then ok "iteration $i: ping OK"; else bad "iteration $i: ping FAILED"; fi
 
-	# Gate on Auto_Master completing (issue step 4 assumes it has). This also
-	# ensures the admin password is the master password before the NEXT reset's
-	# authenticated JNAP call. A failure here is a different problem, not #451 —
-	# but we still diagnose lighttpd since we're in the failing window.
-	if ! wait_auto_master; then
-		bad "iteration $i: Auto_Master did not complete — cannot fairly assess web yet"
-		FAIL_ITER=$i
-		diagnose_failure "$i"
-		break
-	fi
+	# Let Auto_Master settle (issue step 4 assumes it has). NOTE: in a single-DUT
+	# topology with WAN, the node becomes its own master, so on the boot right after
+	# a reset Auto_Master often sees "a master already exists" and exits 'failed',
+	# leaving the unit unconfigured (mode=0, web pw reverts to 'admin'). That is
+	# EXPECTED here and is NOT #451 — so this is informational only, never fatal.
+	# #451 is purely about lighttpd being refused, which we assess by web_ok below.
+	wait_auto_master || info "  (auto-master did not fully complete — expected in single-DUT/WAN setup; continuing)"
 
 	# poll web up to REACH_TIMEOUT (issue step 4/8: web UI must load)
 	w=0; webup=0
@@ -321,6 +350,9 @@ for i in $(seq 1 "$ITERATIONS"); do
 		if web_ok; then webup=1; break; fi
 		sleep 3; w=$((w+3))
 	done
+
+	# Always record lighttpd's real state this iteration (proves the correlation).
+	log_lighttpd_state "iter $i"
 
 	if [ "$webup" -eq 1 ]; then
 		ok "iteration $i: web UI reachable (after ${w}s)"
