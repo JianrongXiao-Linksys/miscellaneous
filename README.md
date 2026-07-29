@@ -956,6 +956,12 @@ cd web_gui_factory_reset_test
 | `--no-ssh` | skip SSH gating/diagnostics (repro only) | off |
 | `--no-wan` | factory Born-On SOP: WAN unplugged, no Auto_Master, pw stays `admin` | off |
 | `--factory-cgi` | also require `/factory.cgi` Born-On status == `Idle` after each reset | off |
+| `--factory-flow` | aggressive timing: next reset on first ping (implies the two above) | off |
+| `--grace N` | seconds after ping before the factory checks | `10` |
+| `--jason-flow` | the reporter's own documented sequence, verbatim | off |
+| `--iface IF` | bind pings + curl to this interface (reporter ran the loop over Wi-Fi) | default route |
+| `--ssid SSID` | SSID to reconnect to on a ping timeout (doc 4.5 retry path) | — |
+| `--extra-pass P` | add another per-unit `default_passphrase` candidate | `Da8@Wfqes4` |
 
 #### No-WAN mode (factory Born-On validation SOP)
 
@@ -966,6 +972,29 @@ With WAN unplugged, **Auto_Master never runs** — the unit stays unconfigured (
 ```bash
 ./reset_web_test.sh -i 192.168.1.1 -p admin -n 15 --no-wan --factory-cgi --recover
 ```
+
+#### `--jason-flow` — the reporter's exact stress test
+
+The reporter could not release the C++ source (internal test framework) but supplied a command/sequence reference, kept at [`web_gui_factory_reset_test/reference/FactoryResetConnectionStressTest.txt`](web_gui_factory_reset_test/reference/FactoryResetConnectionStressTest.txt). `--jason-flow` implements it verbatim so results are comparable 1:1 (implies `--no-wan` + `--factory-cgi`):
+
+reset via `POST http://IP/JNAP/` (**plain :80**, `--connect-timeout 5 --max-time 20`) → require **both** `"result": "OK"` **and** `DeviceRestart` → confirm unreachable (**2 failed pings**, 90 s) → wait **20 s** → wait pingable (**3 good pings**; on timeout reconnect Wi-Fi + retry 60 s) → wait **10 s**, no Auto_Master check → `GET https://IP/factory.cgi` with `Authorization: Basic` (`--connect-timeout 5 --max-time 15`) → judge the **curl exit code only** → wait **10 s** → next cycle.
+
+Key differences this closed versus our own `--factory-flow`:
+
+- **Traffic path** — the reporter's PC had **both** wired and Wi-Fi connected; connectivity was pre-checked on wired, but the stress loop ran over **Wi-Fi**. A Wi-Fi client re-associates after every reset, so its first ping arrives later and by a different path. `--iface`/`--ssid` match that.
+- HTTP (:80) rather than HTTPS for the reset; `DeviceRestart` also required.
+- Explicit 2-failed-ping disconnect confirmation and a **20 s** post-disconnect wait (we had neither).
+- **3** successful pings before proceeding, not one.
+- `factory.cgi` judged by exit code only — a reachable CGI with an unexpected body passes for them.
+
+```bash
+nmcli device wifi connect Linksys00002 password '<passphrase>' ifname wlp0s20f3
+
+./reset_web_test.sh -i 192.168.1.1 -p '<passphrase>' -n 20 --jason-flow \
+    --iface wlp0s20f3 --ssid Linksys00002 --no-ssh
+```
+
+**Firmware note:** the reporter reproduced on **M60PW-HK fw 1.0.18.26042406**; our units run **1.2.3.26072311**. That difference is unresolved and should accompany any result.
 
 Exit code `1` = bug reproduced (or DUT unreachable); `0` = all N resets recovered.
 

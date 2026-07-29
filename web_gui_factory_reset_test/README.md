@@ -127,7 +127,68 @@ cd /home/jianrong/code/claude/miscellaneous/web_gui_factory_reset_test
 #   --no-ssh        skip SSH gating/diagnostics (repro only; fixed-waits Auto_Master)
 #   --no-wan        factory Born-On SOP: WAN unplugged, no Auto_Master, pw stays 'admin'
 #   --factory-cgi   also require /factory.cgi Born-On status == 'Idle' after each reset
+#   --factory-flow  our aggressive timing: next reset on first ping (implies the two above)
+#   --grace N       seconds after ping before the factory checks (default 10)
+#   --jason-flow    the reporter's own documented sequence, verbatim (see below)
+#   --iface IF      bind pings + curl to this interface (reporter ran the loop over Wi-Fi)
+#   --ssid SSID     SSID to reconnect to on a ping timeout (the doc 4.5 retry path)
+#   --extra-pass P  add another per-unit default_passphrase candidate
 ```
+
+## `--jason-flow` — the reporter's exact stress test
+
+The reporter (Jason) could not share the C++ source, but provided a command and
+sequence reference: `reference/FactoryResetConnectionStressTest.txt`. `--jason-flow`
+implements that document verbatim so our runs are comparable 1:1. It implies
+`--no-wan` and `--factory-cgi`.
+
+| Step | Doc § | Behaviour |
+|---|---|---|
+| 1 | 1, 4.1 | `POST http://IP/JNAP/` (**plain :80**), `--connect-timeout 5 --max-time 20` |
+| 2 | 4.2 | Response must contain **both** `"result": "OK"` **and** `DeviceRestart` |
+| 3 | 4.3 | Confirm unreachable: **2 failed pings**, 90 s timeout |
+| 4 | 4.4 | Wait **20 s** after the DUT is confirmed unreachable |
+| 5 | 4.5 | Wait pingable: **3 successful pings**; on timeout, **reconnect Wi-Fi** and retry 60 s |
+| 6 | 4.6 | Wait **10 s**. No Auto_Master check |
+| 7 | 2, 4.7 | `GET https://IP/factory.cgi` with `Authorization: Basic`, `--connect-timeout 5 --max-time 15` |
+| 8 | 4.8 | Judge the **curl exit code only** — their tool does *not* check for `Idle` |
+| 9 | 4.9 | Wait **10 s**, then next cycle |
+| — | 5 | 20 cycles |
+
+### How this differs from our own `--factory-flow`
+
+These were the gaps between the two harnesses, and each one narrows the race window
+differently:
+
+- **Traffic path.** The reporter's PC had **both** wired and Wi-Fi connected to the DUT;
+  connectivity was pre-checked on wired, but the *stress loop itself* ran over **Wi-Fi**.
+  A Wi-Fi client must re-associate after every reset, so its first successful ping comes
+  later and from a different path than a wired client's. `--iface`/`--ssid` match this.
+- **Reset scheme.** Theirs posts to `http://` (:80); ours tried `https://` first.
+- **Accept criteria.** Theirs additionally requires `DeviceRestart` in the response.
+- **Disconnect confirmation.** Theirs requires 2 failed pings within 90 s; we had no
+  explicit requirement and once mistook a slow shutdown for a completed reset.
+- **20 s post-disconnect wait**, which we did not have at all.
+- **3 successful pings** before proceeding, vs our single first ping.
+- **`factory.cgi` verdict.** Theirs judges the curl exit code only, so a reachable CGI
+  returning an unexpected body would *pass* for them. We log both, and still note when
+  the body is not `Idle`.
+
+### Usage (matching the reporter's topology)
+
+```bash
+# Both links up: wired stays connected, the loop runs over Wi-Fi.
+nmcli device wifi connect Linksys00002 password '<passphrase>' ifname wlp0s20f3
+
+./reset_web_test.sh -i 192.168.1.1 -p '<passphrase>' -n 20 --jason-flow \
+    --iface wlp0s20f3 --ssid Linksys00002 --no-ssh
+```
+
+### Firmware note
+
+The reporter's reproduction used **M60PW-HK firmware 1.0.18.26042406**. Our units run
+**1.2.3.26072311**. That is an unresolved difference between the two environments and
+should be stated with any result from this tool.
 
 ## No-WAN mode (factory Born-On validation SOP)
 

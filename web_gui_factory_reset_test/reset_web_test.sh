@@ -37,6 +37,41 @@
 # --factory-cgi : after each reset also GET /factory.cgi and require the Born-On status
 #             to read 'Idle' (per the Industrial Cloud / Born-On factory validation SOP).
 #             This exercises lighttpd's CGI handler, not just the TCP socket.
+# --factory-flow : replicate the production station timing EXACTLY (implies --no-wan
+#             and --factory-cgi). The station proceeds the moment the DUT answers
+#             ping — it does NOT wait for Auto_Master or full init. After a short
+#             grace (--grace, default 10s) it does an HTTPS GET of factory.cgi then a
+#             JNAP request on port 80; a refusal there is the recorded factory failure.
+#             Firing the next reset this early is what makes the lighttpd
+#             single-LAN-ifup start race actually lose (reporter: fails on 4th-5th).
+# --grace N : seconds to wait after ping before the factory checks (default 10)
+#
+# Example (reporter's exact reproduction conditions):
+#   ./reset_web_test.sh -i 192.168.1.1 -p admin -n 20 --factory-flow
+#
+# --jason-flow : replicate the reporter's own stress test byte-for-byte, per
+#             FactoryResetConnectionStressTest.txt (implies --no-wan + --factory-cgi).
+#             Differences from --factory-flow, all taken from that document:
+#               * reset POSTed to http://IP/JNAP/ (:80) first, not https
+#               * response must contain BOTH "result":"OK" AND "DeviceRestart"
+#               * disconnect check: 2 failed pings, 90s timeout  (doc 4.3)
+#               * wait 20s after the DUT is confirmed unreachable (doc 4.4)
+#               * reconnect check: 3 successful pings, then Wi-Fi reconnect + 60s
+#                 retry if the first window times out                (doc 4.5)
+#               * wait 10s after pingable, no Auto_Master check      (doc 4.6)
+#               * factory.cgi with an Authorization: Basic header, --connect-timeout 5
+#                 --max-time 15, and ONLY the curl exit code is judged — their tool
+#                 does not check for 'Idle' (doc 2, 4.7-4.8)
+#               * wait 10s before the next cycle                     (doc 4.9)
+# --iface IF: bind pings and curl to this interface. The reporter ran the whole loop
+#             over Wi-Fi (both wired and Wi-Fi were connected), so matching the
+#             traffic path matters — a Wi-Fi client also has to re-associate after
+#             every reset, which widens the window the race needs.
+# --ssid S  : SSID to reconnect to on a ping timeout (the doc 4.5 retry path).
+#
+# Example (reporter's exact tool, over Wi-Fi):
+#   ./reset_web_test.sh -i 192.168.1.1 -p 'Da8@Wfqes4' -n 20 --jason-flow \
+#       --iface wlp0s20f3 --ssid Linksys00002 --no-ssh
 #
 set -u
 
@@ -58,6 +93,28 @@ DO_RECOVER=0         # on failure, run `/etc/init.d/lighttpd start` to recover
 USE_SSH=1            # SSH diagnostics + auto-master gating (needs SSH_PASS)
 NO_WAN=0             # factory-SOP mode: WAN unplugged -> no Auto_Master, pw stays 'admin'
 CHECK_FACTORY_CGI=0  # also verify /factory.cgi Born-On status returns 'Idle' after reset
+FACTORY_FLOW=0       # replicate the factory station flow exactly (see below)
+FF_GRACE=10          # --factory-flow: seconds to wait after ping before checking web
+# Additional per-unit default_passphrase candidates. default_passphrase differs per
+# device, so keep the known ones here and let --extra-pass add more at runtime.
+EXTRA_PASS="Da8@Wfqes4"
+DOWN_WAIT=150        # max seconds to wait for the DUT to drop off after an accepted reset
+
+# ---- --jason-flow: the reporter's documented stress test, verbatim ----
+# Source: FactoryResetConnectionStressTest.txt (Jason, Linksys). Every constant below
+# is taken from that document so our run is comparable to theirs 1:1. Notable
+# differences from our own --factory-flow are called out in the README.
+JASON_FLOW=0
+JF_DOWN_TIMEOUT=90   # doc 4.3: disconnect-check timeout
+JF_DOWN_FAILS=2      # doc 4.3: require two failed ping checks
+JF_AFTER_DOWN=20     # doc 4.4: wait 20s after the DUT is confirmed unreachable
+JF_UP_OKS=3          # doc 4.5: require three successful ping checks
+JF_UP_TIMEOUT=120    # doc 4.5: "maximum initial wait ... controlled by test config"
+JF_UP_RETRY=60       # doc 4.5: on timeout, reconnect Wi-Fi and retry for another 60s
+JF_AFTER_UP=10       # doc 4.6: wait 10s after pingable, no Auto_Master check
+JF_CYCLE_WAIT=10     # doc 4.9: wait 10s before the next Factory Reset cycle
+IFACE=""             # bind ping/curl to this interface (Jason ran the loop over Wi-Fi)
+WIFI_SSID=""         # --ssid: reconnect to this SSID on ping timeout (doc 4.5 retry)
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 LOG_DIR="$SCRIPT_DIR/logs"
 
@@ -76,6 +133,12 @@ while [ $# -gt 0 ]; do
 		--no-ssh) USE_SSH=0; shift;;
 		--no-wan) NO_WAN=1; shift;;               # factory SOP: WAN unplugged, no Auto_Master
 		--factory-cgi) CHECK_FACTORY_CGI=1; shift;;
+		--factory-flow) FACTORY_FLOW=1; NO_WAN=1; CHECK_FACTORY_CGI=1; shift;;
+		--grace) FF_GRACE="$2"; shift 2;;
+		--extra-pass) EXTRA_PASS="$EXTRA_PASS $2"; shift 2;;
+		--jason-flow) JASON_FLOW=1; NO_WAN=1; CHECK_FACTORY_CGI=1; shift;;
+		--iface) IFACE="$2"; shift 2;;
+		--ssid) WIFI_SSID="$2"; shift 2;;
 		-h|--help) grep '^#' "$0" | sed 's/^# \?//'; exit 0;;
 		*) echo "Unknown arg: $1"; exit 2;;
 	esac
@@ -93,7 +156,30 @@ ok()   { log "${C_GRN}PASS${C_RST} $*"; }
 bad()  { log "${C_RED}FAIL${C_RST} $*"; }
 info() { log "${C_CYN}$*${C_RST}"; }
 
-ping_ok() { ping -c1 -W2 "$DUT_IP" >/dev/null 2>&1; }
+# Jason ran the whole stress loop over the Wi-Fi link to the DUT, not the wired LAN.
+# --iface binds our pings and curl requests to a chosen interface so the traffic path
+# matches. Empty = default routing (wired), which is what we used before.
+ping_ok() {
+	if [ -n "$IFACE" ]; then
+		ping -I "$IFACE" -c1 -W2 "$DUT_IP" >/dev/null 2>&1
+	else
+		ping -c1 -W2 "$DUT_IP" >/dev/null 2>&1
+	fi
+}
+
+# curl args for interface binding (used by every request when --iface is given).
+curl_iface() { [ -n "$IFACE" ] && printf '%s' "--interface $IFACE"; }
+
+# doc 4.5 retry: "reconnect the test PC to the DUT SSID and retry for another 60s".
+# Their C++ program did this; we do the nmcli equivalent when --ssid is supplied.
+wifi_reconnect() {
+	[ -z "$WIFI_SSID" ] && { log "  (no --ssid given; skipping Wi-Fi reconnect step)"; return 1; }
+	log "  reconnecting test PC to SSID '$WIFI_SSID' (doc 4.5 retry path)"
+	nmcli device wifi connect "$WIFI_SSID" ${IFACE:+ifname "$IFACE"} >/dev/null 2>&1
+	local rc=$?
+	[ "$rc" -eq 0 ] && log "  Wi-Fi reconnected" || bad "  Wi-Fi reconnect failed (rc=$rc)"
+	return $rc
+}
 
 # web_ok: returns 0 if either :80 or :443 accepts a TCP/HTTP connection.
 # We only care that the socket is LISTENing (bug = connection refused), so any
@@ -180,8 +266,38 @@ check_factory_cgi() {
 
 # JNAP result is OK only if it contains "OK". A response with _ErrorUnauthorized
 # (wrong/missing auth) or any _Error* must NOT be treated as success.
+# Jason's doc (section 1) additionally requires "DeviceRestart" in the response, which
+# is the stronger check: it proves the DUT accepted the reset AND will reboot.
 jnap_result_ok() {
-	echo "$1" | grep -q '"result"[[:space:]]*:[[:space:]]*"OK"'
+	echo "$1" | grep -q '"result"[[:space:]]*:[[:space:]]*"OK"' || return 1
+	if [ "$JASON_FLOW" -eq 1 ]; then
+		echo "$1" | grep -q 'DeviceRestart' || return 1
+	fi
+	return 0
+}
+
+# doc section 2: factory.cgi check, exactly as the reporter's tool issues it —
+#   curl -k -sS --connect-timeout 5 --max-time 15 -H "Authorization:Basic <..>" \
+#        "https://192.168.1.1/factory.cgi"
+# and it checks ONLY the curl exit code; it does NOT validate that the body says
+# "Idle". We record both so we can tell a refused socket (their failure) apart from
+# a reachable CGI that returned an unexpected state (which their tool would pass).
+check_factory_cgi_jason() {
+	local tag="$1" pass="$2" body rc auth
+	auth=$(printf '%s:%s' "$JNAP_USER" "$pass" | base64 | tr -d '\n')
+	body=$(curl -k -sS $(curl_iface) --connect-timeout 5 --max-time 15 \
+		-H "Authorization:Basic $auth" "https://$DUT_IP/factory.cgi" 2>&1)
+	rc=$?
+	local status
+	status=$(echo "$body" | grep -vE '^\s*$|-----' | tail -1 | tr -d '\r' | tr -d ' ')
+	if [ "$rc" -eq 0 ]; then
+		ok "  [$tag] factory.cgi CURL_EXIT_CODE=0 (HTTPS OK); body status='${status:-<empty>}'"
+		[ "$status" = "Idle" ] || bad "  [$tag] note: body is not 'Idle' (their tool does not check this)"
+		return 0
+	fi
+	bad "  [$tag] factory.cgi CURL_EXIT_CODE=$rc (refused/timeout) <<< the reporter's failure"
+	log  "  [$tag] curl said: $(echo "$body" | tr -d '\n' | head -c 160)"
+	return 1
 }
 
 # One JNAP FactoryReset POST on the given scheme with the given password.
@@ -194,7 +310,16 @@ jnap_factory_reset() {
 		auth=$(printf '%s:%s' "$JNAP_USER" "$pass" | base64 | tr -d '\n')
 		authhdr=(-H "X-JNAP-Authorization: Basic $auth")
 	fi
-	curl -s $insecure -m 12 -X POST \
+	if [ "$JASON_FLOW" -eq 1 ]; then
+		# doc section 1, verbatim timeouts: --connect-timeout 5 --max-time 20
+		curl -sS $insecure $(curl_iface) --connect-timeout 5 --max-time 20 -X POST \
+			-H "Content-Type: application/json" \
+			-H "X-JNAP-Action: $JNAP_ACTION" \
+			"${authhdr[@]}" \
+			-d '{}' "$scheme://$DUT_IP/JNAP/" 2>&1
+		return
+	fi
+	curl -s $insecure $(curl_iface) -m 12 -X POST \
 		-H "Content-Type: application/json" \
 		-H "X-JNAP-Action: $JNAP_ACTION" \
 		"${authhdr[@]}" \
@@ -211,17 +336,36 @@ trigger_factory_reset() {
 	local out scheme pass pwlist
 	# no-WAN: unit never leaves unconfigured mode, so "admin"/no-auth is the norm — try
 	# those first. With WAN, Auto_Master applies the master passphrase, so try that first.
-	if [ "$NO_WAN" -eq 1 ]; then pwlist="admin $JNAP_PASS"; else pwlist="$JNAP_PASS admin"; fi
-	for scheme in https http; do
+	# $EXTRA_PASS lets a second per-unit passphrase be tried (default_passphrase is
+	# per-device, e.g. 8xPghzqdr@ on one DUT and Da8@Wfqes4 on another) so a hardware
+	# swap does not look like a failure.
+	if [ "$NO_WAN" -eq 1 ]; then pwlist="admin $JNAP_PASS $EXTRA_PASS"; else pwlist="$JNAP_PASS $EXTRA_PASS admin"; fi
+	# doc section 1 posts the reset to http://192.168.1.1/JNAP/ (plain :80), so try
+	# that scheme first when replicating their flow.
+	local schemes="https http"
+	[ "$JASON_FLOW" -eq 1 ] && schemes="http https"
+	for scheme in $schemes; do
 		for pass in $pwlist ""; do
 			out=$(jnap_factory_reset "$scheme" "$pass")
 			if jnap_result_ok "$out"; then
+				# Remember the credential that worked so the factory.cgi Authorization
+				# header can reuse it (Jason's check sends one).
+				JNAP_PASS_OK="$pass"
 				log "  JNAP FactoryReset accepted ($scheme, pw='${pass:-<none>}'): $(echo "$out" | tr -d '\n' | head -c 120)"
 				return 0
 			fi
 		done
 	done
 	log "  ${C_YEL}JNAP not accepted on any scheme/password. Last: $(echo "$out" | tr -d '\n' | head -c 100)${C_RST}"
+	# Distinguish "web server is dead" from "we used the wrong password". A JNAP
+	# error body (e.g. _ErrorUnauthorized) is proof lighttpd IS alive and answering,
+	# so it must never be scored as #451. Record that for the caller.
+	if echo "$out" | grep -q '"result"'; then
+		TRIGGER_WEB_ALIVE=1
+		bad "  Web server IS alive (JNAP answered with an error) — this is an AUTH problem, not #451."
+	else
+		TRIGGER_WEB_ALIVE=0
+	fi
 	if have_ssh; then
 		log "  ${C_YEL}Falling back to SSH jffs2reset${C_RST}"
 		dut_ssh "jffs2reset -y >/dev/null 2>&1; (sleep 1; reboot) &" >/dev/null 2>&1
@@ -231,21 +375,73 @@ trigger_factory_reset() {
 	return 1
 }
 
+# ---- Jason-flow reboot detection (doc sections 4.3 / 4.5) ----
+# Deliberately different from wait_reboot(): their disconnect check requires TWO failed
+# pings within 90s, and their reconnect check requires THREE successful pings, with a
+# Wi-Fi reconnect + 60s extra retry if the first window times out.
+jf_wait_down() {
+	local waited=0 fails=0
+	while [ "$waited" -lt "$JF_DOWN_TIMEOUT" ]; do
+		if ping_ok; then fails=0; else
+			fails=$((fails+1))
+			if [ "$fails" -ge "$JF_DOWN_FAILS" ]; then
+				log "  DUT unreachable after ${waited}s (${JF_DOWN_FAILS} failed pings) [doc 4.3]"
+				return 0
+			fi
+		fi
+		sleep 1; waited=$((waited+1))
+	done
+	bad "  DUT never went unreachable within ${JF_DOWN_TIMEOUT}s [doc 4.3] — reset did not take effect"
+	return 1
+}
+
+jf_wait_up() {
+	local phase_timeout="$1" waited=0 oks=0
+	while [ "$waited" -lt "$phase_timeout" ]; do
+		if ping_ok; then
+			oks=$((oks+1))
+			if [ "$oks" -ge "$JF_UP_OKS" ]; then
+				log "  DUT pingable after ~${waited}s (${JF_UP_OKS} successful pings) [doc 4.5]"
+				return 0
+			fi
+		else
+			oks=0
+		fi
+		sleep 1; waited=$((waited+1))
+	done
+	return 1
+}
+
 # wait until DUT stops responding (reboot started) then comes back to ping.
 wait_reboot() {
 	local waited=0
-	# give it a moment to actually go down (best-effort, don't require it)
+	# Wait for the DUT to actually go down. This is NOT optional: some units take well
+	# over a minute between accepting the JNAP reset and dropping the link (the overlay
+	# wipe runs first). If we give up early, the "post-reset" checks below run against
+	# the OLD boot and the next reset is fired mid-wipe — when JNAP rejects every
+	# credential. So allow up to DOWN_WAIT and say plainly when it never happened.
 	local down=0
-	for _ in $(seq 1 30); do
+	for _ in $(seq 1 "$DOWN_WAIT"); do
 		if ! ping_ok; then down=1; break; fi
 		sleep 1; waited=$((waited+1))
 	done
-	[ "$down" -eq 1 ] && log "  DUT went down after ${waited}s, waiting for reboot..." \
-		|| log "  DUT never observed down (fast reboot?), waiting for stable ping..."
+	if [ "$down" -eq 1 ]; then
+		log "  DUT went down after ${waited}s, waiting for reboot..."
+	else
+		bad "  DUT never went down within ${DOWN_WAIT}s of an accepted reset — reset did not take effect"
+		return 1
+	fi
 	# now wait for it to come back
 	waited=0
 	while [ "$waited" -lt "$BOOT_WAIT" ]; do
 		if ping_ok; then
+			# Factory flow: the station proceeds on the FIRST successful ping — no
+			# confirmation delay. Returning immediately preserves the aggressive
+			# timing that makes the lighttpd startup race lose.
+			if [ "$FACTORY_FLOW" -eq 1 ]; then
+				log "  DUT reachable again after ~${waited}s (first ping; factory-flow)"
+				return 0
+			fi
 			# require 2 consecutive good pings to be sure it's really up
 			sleep 2
 			if ping_ok; then
@@ -253,7 +449,7 @@ wait_reboot() {
 				return 0
 			fi
 		fi
-		sleep 3; waited=$((waited+3))
+		sleep 1; waited=$((waited+1))
 	done
 	bad "  DUT did not become pingable within ${BOOT_WAIT}s"
 	return 1
@@ -399,6 +595,20 @@ else
 	info " MODE: WAN present — Auto_Master expected to promote unit to master."
 fi
 [ "$CHECK_FACTORY_CGI" -eq 1 ] && info " factory.cgi Born-On check: ENABLED (expect 'Idle' after each reset)"
+if [ "$FACTORY_FLOW" -eq 1 ]; then
+	info " FACTORY-FLOW: next reset fires as soon as ping answers (NO Auto_Master wait)."
+	info "               after ping: ${FF_GRACE}s grace -> HTTPS factory.cgi -> JNAP on :80."
+	info "               This matches the production station timing that reproduces #451."
+fi
+if [ "$JASON_FLOW" -eq 1 ]; then
+	info " JASON-FLOW: replicating FactoryResetConnectionStressTest.txt verbatim."
+	info "   reset via POST http://$DUT_IP/JNAP/ (:80), require \"result\":\"OK\" + DeviceRestart"
+	info "   down: ${JF_DOWN_FAILS} failed pings / ${JF_DOWN_TIMEOUT}s -> wait ${JF_AFTER_DOWN}s"
+	info "   up:   ${JF_UP_OKS} good pings / ${JF_UP_TIMEOUT}s (retry ${JF_UP_RETRY}s after Wi-Fi reconnect)"
+	info "   then wait ${JF_AFTER_UP}s -> factory.cgi (exit-code check only) -> wait ${JF_CYCLE_WAIT}s"
+	info "   path: ${IFACE:-default route (wired)}${WIFI_SSID:+  ssid=$WIFI_SSID}"
+	[ -z "$IFACE" ] && info "   ${C_YEL}NOTE: reporter ran this loop over Wi-Fi; use --iface/--ssid to match.${C_RST}"
+fi
 info " log: $RUN_LOG"
 info "======================================================================"
 
@@ -412,15 +622,146 @@ fi
 
 # ---------------- main loop ----------------
 FAIL_ITER=0
+DONE_ITER=0        # iterations that actually completed a full check (for honest summary)
+ABORT_REASON=""    # non-empty => run ended early for a non-#451 reason
 for i in $(seq 1 "$ITERATIONS"); do
 	info "---------- Factory Reset #$i / $ITERATIONS ----------"
-	trigger_factory_reset || { bad "stop: cannot trigger reset"; break; }
+	if ! trigger_factory_reset; then
+		# A trigger failure is NOT a benign stop. If the DUT still pings but JNAP will
+		# not answer, that IS the #451 signature — the reset request is itself the first
+		# casualty of the dead web server (the catch-22 described in the report).
+		if [ "${TRIGGER_WEB_ALIVE:-0}" -eq 1 ]; then
+			bad "stop: JNAP answered but rejected our credentials (NOT #451 — web is up)."
+			ABORT_REASON="JNAP auth rejected at iteration $i (web server alive; wrong password)"
+		elif ping_ok; then
+			bad "iteration $i: cannot trigger reset while DUT still pings  <<< BUG REPRODUCED"
+			bad "  (JNAP unreachable/refused => web server down; ping is kernel-side)"
+			FAIL_ITER=$i
+			diagnose_failure "$i"
+		else
+			bad "stop: cannot trigger reset and DUT is not pingable (not #451 — DUT down/hung)"
+			ABORT_REASON="reset could not be triggered at iteration $i (DUT not pingable)"
+		fi
+		break
+	fi
 
-	wait_reboot || { FAIL_ITER=$i; bad "iteration $i: DUT never came back (ping)"; break; }
+	if [ "$JASON_FLOW" -eq 1 ]; then
+		# ---- REPORTER'S DOCUMENTED SEQUENCE (FactoryResetConnectionStressTest.txt) ----
+		# 4.3 confirm unreachable (2 failed pings, 90s) -> 4.4 wait 20s ->
+		# 4.5 wait pingable (3 good pings; retry once with Wi-Fi reconnect + 60s) ->
+		# 4.6 wait 10s (no Auto_Master check) -> 4.7/4.8 factory.cgi, check exit code ->
+		# 4.9 wait 10s before the next cycle.
+		if ! jf_wait_down; then
+			ABORT_REASON="DUT never went unreachable at iteration $i (reset did not take effect)"
+			break
+		fi
+		log "  waiting ${JF_AFTER_DOWN}s after disconnect [doc 4.4]"
+		sleep "$JF_AFTER_DOWN"
+
+		if ! jf_wait_up "$JF_UP_TIMEOUT"; then
+			bad "  DUT not pingable within ${JF_UP_TIMEOUT}s — Wi-Fi reconnect + ${JF_UP_RETRY}s retry [doc 4.5]"
+			wifi_reconnect
+			if ! jf_wait_up "$JF_UP_RETRY"; then
+				bad "iteration $i: DUT never became pingable (retry window exhausted)"
+				FAIL_ITER=$i; diagnose_failure "$i"; break
+			fi
+		fi
+
+		log "  waiting ${JF_AFTER_UP}s after pingable, no Auto_Master check [doc 4.6]"
+		sleep "$JF_AFTER_UP"
+
+		log_lighttpd_state "iter $i"
+		if check_factory_cgi_jason "iter $i" "${JNAP_PASS_OK:-admin}"; then
+			DONE_ITER=$i
+			ok "iteration $i: PASSED (factory.cgi CURL_EXIT_CODE=0)"
+		else
+			bad "iteration $i: FAILED — factory.cgi refused  <<< BUG REPRODUCED"
+			if ping_ok; then
+				bad "  ping still OK while HTTPS is refused = the reporter's exact signature"
+			else
+				bad "  NOTE: ping is also down — device-level failure, not web-only"
+			fi
+			FAIL_ITER=$i; diagnose_failure "$i"; break
+		fi
+		log "  waiting ${JF_CYCLE_WAIT}s before the next cycle [doc 4.9]"
+		sleep "$JF_CYCLE_WAIT"
+		continue
+	fi
+
+	if ! wait_reboot; then
+		if ping_ok; then
+			# Never went down / came back but reset didn't take: not the web bug.
+			bad "iteration $i: reset did not take effect (DUT still up) — NOT #451"
+			ABORT_REASON="reset accepted but DUT never rebooted at iteration $i"
+		else
+			FAIL_ITER=$i; bad "iteration $i: DUT never came back (ping)"
+		fi
+		break
+	fi
 
 	# ping check (issue step 3: expected always OK — ICMP is kernel-side)
 	if ping_ok; then ok "iteration $i: ping OK"; else bad "iteration $i: ping FAILED"; fi
 
+	if [ "$FACTORY_FLOW" -eq 1 ]; then
+		# ---- FACTORY STATION FLOW (matches the reporter's reproduction exactly) ----
+		# The production flow proceeds as soon as the DUT answers ping — it does NOT
+		# wait for Auto_Master or full init. After a short grace period it does an
+		# HTTPS GET of factory.cgi, then a JNAP request on port 80. A refusal at that
+		# point is the failure the factory records ("factory.cgi did not return Idle").
+		# Firing the next reset this early cuts into boot, which is what makes the
+		# lighttpd single-LAN-ifup start race actually lose.
+		log "  factory-flow: DUT pingable; waiting ${FF_GRACE}s grace (no Auto_Master wait)"
+		sleep "$FF_GRACE"
+
+		# The #451 signature is ping UP + web REFUSED. A first ping during boot can be
+		# transient (the DUT keeps booting / reboots again), and then *everything* goes
+		# away — that is a reboot, not the bug. So require a live ping here; if it is
+		# gone, re-wait for the DUT and re-apply the grace instead of crying wolf.
+		ff_settle=0
+		while ! ping_ok; do
+			ff_settle=$((ff_settle+1))
+			if [ "$ff_settle" -gt 6 ]; then
+				bad "  [iter $i] DUT ping gone and not returning — treating as reboot, not #451"
+				break
+			fi
+			log "  [iter $i] ping vanished after grace (still booting) — re-waiting for DUT"
+			wait_reboot || break
+			sleep "$FF_GRACE"
+		done
+		if ! ping_ok; then
+			bad "iteration $i: DUT not pingable — cannot evaluate web; stopping"
+			FAIL_ITER=$i; diagnose_failure "$i"; break
+		fi
+
+		log_lighttpd_state "iter $i"
+
+		fcgi_ok=0; jnap80_ok=0
+		if check_factory_cgi "iter $i"; then fcgi_ok=1; fi
+		# JNAP probe on port 80 (plain HTTP), as the factory flow does next.
+		jout=$(curl -s -m 8 -X POST -H "Content-Type: application/json" \
+			-H "X-JNAP-Action: http://linksys.com/jnap/core/GetDeviceInfo" \
+			-d '{}' "http://$DUT_IP/JNAP/" 2>&1)
+		if [ -n "$jout" ] && echo "$jout" | grep -q '"result"'; then
+			jnap80_ok=1
+			ok "  [iter $i] JNAP on :80 responded"
+		else
+			bad "  [iter $i] JNAP on :80 REFUSED/no response"
+		fi
+
+		if [ "$fcgi_ok" -eq 1 ] && [ "$jnap80_ok" -eq 1 ]; then
+			DONE_ITER=$i
+			ok "iteration $i: factory checks PASSED (factory.cgi Idle + JNAP :80)"
+		else
+			bad "iteration $i: factory check FAILED after ${FF_GRACE}s grace  <<< BUG REPRODUCED"
+			bad "  (ping OK but factory.cgi/JNAP refused — matches the reporter's failure)"
+			FAIL_ITER=$i
+			diagnose_failure "$i"
+			break
+		fi
+		continue
+	fi
+
+	# ---- default (tolerant) flow ----
 	# Let Auto_Master settle (issue step 4 assumes it has). NOTE: in a single-DUT
 	# topology with WAN, the node becomes its own master, so on the boot right after
 	# a reset Auto_Master often sees "a master already exists" and exits 'failed',
@@ -440,6 +781,7 @@ for i in $(seq 1 "$ITERATIONS"); do
 	log_lighttpd_state "iter $i"
 
 	if [ "$webup" -eq 1 ]; then
+		DONE_ITER=$i
 		ok "iteration $i: web UI reachable (after ${w}s)"
 		# Factory SOP step: confirm Born-On status went back to 'Idle' after the reset.
 		[ "$CHECK_FACTORY_CGI" -eq 1 ] && check_factory_cgi "iter $i"
@@ -459,6 +801,16 @@ if [ "$FAIL_ITER" -gt 0 ]; then
 	info "Diagnostics saved under: $LOG_DIR/diag_${RUN_TS}_iter${FAIL_ITER}.txt"
 	info "Full run log: $RUN_LOG"
 	exit 1
+elif [ -n "$ABORT_REASON" ]; then
+	# Never claim a full clean run when we stopped early — report what actually ran.
+	bad "RESULT: INCOMPLETE — $DONE_ITER of $ITERATIONS iterations verified before stopping."
+	bad "Reason: $ABORT_REASON"
+	info "Full run log: $RUN_LOG"
+	exit 2
+elif [ "$DONE_ITER" -lt "$ITERATIONS" ]; then
+	bad "RESULT: INCOMPLETE — only $DONE_ITER of $ITERATIONS iterations verified."
+	info "Full run log: $RUN_LOG"
+	exit 2
 else
 	ok "RESULT: completed $ITERATIONS factory resets, web recovered every time (no repro)."
 	info "Full run log: $RUN_LOG"

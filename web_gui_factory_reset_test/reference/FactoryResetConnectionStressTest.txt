@@ -1,0 +1,154 @@
+Factory Reset Connection Reproduction Test
+Command and Test Sequence Reference
+
+
+Notes:
+1. The original test was implemented as a temporary function in our
+   Windows C++ test program.
+
+2. The curl command lines below were extracted from the actual PowerShell
+   command strings used by the test program.
+
+3. The surrounding PowerShell wrapper, working-directory handling, and
+   local result-file output handling are omitted because they do not
+   change the HTTP or HTTPS requests sent to the DUT.
+
+4. Password and authorization values have been redacted.
+
+5. The ping checks, wait times, retry logic, and Wi-Fi reconnection logic
+   were controlled by the C++ test program and are described separately
+   below.
+
+6. Before the stress test, the test PC first checked DUT connectivity
+   through the wired LAN interface.
+
+7. During the Factory Reset stress-test loop, both the ping checks and
+   curl requests were performed through the Wi-Fi connection to the DUT.
+
+8. This document is a command and sequence reference. It is not a
+   standalone executable script.
+
+
+============================================================
+1. Factory Reset request
+============================================================
+
+The following curl command and parameters were used to send the Factory
+Reset request:
+
+curl.exe -sS --connect-timeout 5 --max-time 20 -X POST "http://192.168.1.1/JNAP/" -H "Content-Type: application/json" -H "X-JNAP-Action: http://linksys.com/jnap/core/FactoryReset" -H "X-JNAP-Authorization: Basic <REDACTED>" -d "{}"
+
+The original Windows test program executed this command through
+PowerShell and saved both the curl output and error output to a local
+result file.
+
+After the request completed, the test confirmed that the response
+contained both of the following strings:
+
+"result": "OK"
+
+"DeviceRestart"
+
+
+============================================================
+2. factory.cgi connection check
+============================================================
+
+The following curl command and parameters were used to access
+factory.cgi:
+
+curl.exe -k -sS --connect-timeout 5 --max-time 15 -H "Authorization:Basic <REDACTED>" "https://192.168.1.1/factory.cgi"
+
+The original Windows test program executed this command through
+PowerShell, captured the curl exit code, and saved the response and exit
+code to a local result file.
+
+The result file contained an additional line in the following format:
+
+CURL_EXIT_CODE=<curl exit code>
+
+CURL_EXIT_CODE=0:
+The HTTPS request was completed successfully.
+
+CURL_EXIT_CODE is not 0:
+The request failed, timed out, or could not connect to the HTTPS service.
+
+This stress-test function checked the curl exit code only. It did not
+separately validate whether the factory.cgi response contained "Idle".
+
+
+============================================================
+3. Test connection setup
+============================================================
+
+The test PC had both of the following connections to the DUT:
+
+1. A wired LAN connection.
+2. A Wi-Fi connection to the DUT SSID.
+
+Before starting the stress-test loop, DUT connectivity was first checked
+by pinging 192.168.1.1 through the wired LAN interface.
+
+The test PC then connected to the DUT SSID.
+
+During the Factory Reset stress-test loop, the Factory Reset request,
+ping checks, and factory.cgi request were performed through the Wi-Fi
+connection.
+
+
+============================================================
+4. Test sequence
+============================================================
+
+During each Factory Reset stress-test cycle:
+
+1. Send the HTTP JNAP Factory Reset request through the Wi-Fi connection.
+
+2. Confirm that the response contains:
+
+   - "result": "OK"
+   - "DeviceRestart"
+
+3. Through the Wi-Fi interface, confirm that the DUT becomes unreachable.
+
+   Disconnect-check conditions:
+
+   - Timeout: 90 seconds
+   - Require two failed ping checks
+
+4. After confirming that the DUT is unreachable, wait 20 seconds.
+
+5. Through the Wi-Fi interface, wait until the DUT becomes pingable.
+
+   Reconnect-check conditions:
+
+   - Require three successful ping checks
+   - The maximum initial wait time is controlled by the test configuration
+   - If the initial check times out, reconnect the test PC to the DUT SSID
+     and retry for another 60 seconds
+
+6. After the DUT becomes pingable, wait 10 seconds.
+
+   No additional Auto_Master completion check was performed before
+   accessing factory.cgi.
+
+7. Access the following URL through the Wi-Fi connection:
+
+   https://192.168.1.1/factory.cgi
+
+   curl conditions:
+
+   - Ignore the HTTPS certificate check
+   - Connection timeout: 5 seconds
+   - Maximum execution time: 15 seconds
+
+8. Record and check the curl exit code.
+
+9. Wait 10 seconds before starting the next Factory Reset cycle.
+
+
+============================================================
+5. Test count
+============================================================
+
+The configured stress-test count was 20 Factory Reset cycles.
