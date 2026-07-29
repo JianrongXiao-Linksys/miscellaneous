@@ -125,6 +125,53 @@ cd /home/jianrong/code/claude/miscellaneous/web_gui_factory_reset_test
 #   -a SECONDS      max Auto_Master completion wait          (default 240)
 #   --recover       on failure, `/etc/init.d/lighttpd start` to confirm recovery
 #   --no-ssh        skip SSH gating/diagnostics (repro only; fixed-waits Auto_Master)
+#   --no-wan        factory Born-On SOP: WAN unplugged, no Auto_Master, pw stays 'admin'
+#   --factory-cgi   also require /factory.cgi Born-On status == 'Idle' after each reset
+```
+
+## No-WAN mode (factory Born-On validation SOP)
+
+The reporter's scenario comes from the **Linksys Industrial Cloud / Born-On Date factory
+validation SOP**, not from normal end-user use. On the production line the factory
+connects WAN for cloud (Born-On) validation, then **removes the WAN cable**, factory-resets
+the unit, and re-checks `factory.cgi` to confirm the status returns to `Idle` before the
+unit leaves the line.
+
+With the WAN cable removed the device behaves differently, which changes the test:
+
+| | WAN connected | **WAN unplugged (`--no-wan`)** |
+|---|---|---|
+| Auto_Master | Runs; promotes unit to master | **Never runs** (no WAN IP to obtain) |
+| `linksys.smart_mode.mode` | becomes `2` (master) | stays **`0` (unconfigured)** |
+| Web/admin password | default passphrase (`8xPghzqdr@`) | stays **`admin`** permanently |
+| Auto_Master gate | tool waits for completion | **skipped** (nothing to wait for) |
+| JNAP auth order | master pw first | **`admin` / no-auth first** |
+
+`--no-wan` therefore skips the Auto_Master wait entirely (it would just burn the timeout
+every iteration), logs the observed `mode`/password so a *non*-zero mode is flagged, and
+reorders the JNAP + SSH credential attempts to try `admin` first.
+
+### `factory.cgi` Born-On check (`--factory-cgi`)
+
+`/www/factory.cgi` is a 20-line shell CGI that prints the Born-On state from uci
+`dbon.bootstatus`:
+
+| uci state | Output |
+|---|---|
+| `success=1` | `Success` |
+| `success=-1` | `Failure` |
+| `running=1` | `Running` |
+| otherwise | **`Idle`** |
+
+A factory reset wipes `/etc/config/dbon`; `etc/uci-defaults/dbon.defaults` then recreates it
+with `running=0`/`success=0`, so the post-reset SOP expectation of **`Idle`** is confirmed by
+the source. `--factory-cgi` asserts that after every reset — and because it goes through
+lighttpd's `mod_cgi` handler, it is a stronger web check than a bare TCP/socket probe.
+
+### Usage for the factory SOP scenario
+
+```bash
+./reset_web_test.sh -i 192.168.1.1 -p admin -n 15 --no-wan --factory-cgi --recover
 ```
 
 The default password is `8xPghzqdr@` (the master-mode passphrase for this build);

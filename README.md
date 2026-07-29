@@ -954,6 +954,18 @@ cd web_gui_factory_reset_test
 | `-a SECONDS` | max Auto_Master completion wait | `240` |
 | `--recover` | on failure, `/etc/init.d/lighttpd start` to confirm recovery | off |
 | `--no-ssh` | skip SSH gating/diagnostics (repro only) | off |
+| `--no-wan` | factory Born-On SOP: WAN unplugged, no Auto_Master, pw stays `admin` | off |
+| `--factory-cgi` | also require `/factory.cgi` Born-On status == `Idle` after each reset | off |
+
+#### No-WAN mode (factory Born-On validation SOP)
+
+The reporter's scenario is the **Industrial Cloud / Born-On Date factory validation SOP**, not normal end-user use: the line connects WAN for cloud validation, then **removes the WAN cable**, factory-resets, and re-checks `factory.cgi` for `Idle`.
+
+With WAN unplugged, **Auto_Master never runs** — the unit stays unconfigured (`smart_mode.mode=0`) and the web/admin password stays **`admin`** permanently. `--no-wan` skips the Auto_Master gate and tries `admin`/no-auth credentials first. `--factory-cgi` additionally asserts the Born-On status reads `Idle` after each reset (this also exercises lighttpd's CGI handler, a stronger check than a bare socket probe).
+
+```bash
+./reset_web_test.sh -i 192.168.1.1 -p admin -n 15 --no-wan --factory-cgi --recover
+```
 
 Exit code `1` = bug reproduced (or DUT unreachable); `0` = all N resets recovered.
 

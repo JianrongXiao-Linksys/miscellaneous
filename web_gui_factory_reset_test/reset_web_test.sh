@@ -23,9 +23,20 @@
 # Usage:
 #   ./reset_web_test.sh [-i DUT_IP] [-p SSH_PASS] [-u SSH_USER] [-n ITERATIONS]
 #                       [-w BOOT_WAIT] [-t REACH_TIMEOUT] [--recover] [--no-ssh]
+#                       [--no-wan] [--factory-cgi]
 #
-# Example:
-#   ./reset_web_test.sh -i 192.168.1.1 -p 'admin' -n 15 --recover
+# Example (normal, WAN connected -> Auto_Master runs):
+#   ./reset_web_test.sh -i 192.168.1.1 -p '8xPghzqdr@' -n 15 --recover
+#
+# Example (factory Born-On SOP: WAN UNPLUGGED, LAN connected):
+#   ./reset_web_test.sh -i 192.168.1.1 -p admin -n 15 --no-wan --factory-cgi --recover
+#
+# --no-wan  : WAN cable removed. Auto_Master never runs, so the unit stays UNCONFIGURED
+#             (linksys.smart_mode.mode=0) and the web/admin password stays 'admin'
+#             permanently. Skips the Auto_Master gate and tries 'admin'/no-auth first.
+# --factory-cgi : after each reset also GET /factory.cgi and require the Born-On status
+#             to read 'Idle' (per the Industrial Cloud / Born-On factory validation SOP).
+#             This exercises lighttpd's CGI handler, not just the TCP socket.
 #
 set -u
 
@@ -45,6 +56,8 @@ AM_TIMEOUT=240       # max seconds to wait for Auto_Master to complete (mode->ma
 JNAP_ACTION="http://linksys.com/jnap/core/FactoryReset"
 DO_RECOVER=0         # on failure, run `/etc/init.d/lighttpd start` to recover
 USE_SSH=1            # SSH diagnostics + auto-master gating (needs SSH_PASS)
+NO_WAN=0             # factory-SOP mode: WAN unplugged -> no Auto_Master, pw stays 'admin'
+CHECK_FACTORY_CGI=0  # also verify /factory.cgi Born-On status returns 'Idle' after reset
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 LOG_DIR="$SCRIPT_DIR/logs"
 
@@ -61,6 +74,8 @@ while [ $# -gt 0 ]; do
 		-a) AM_TIMEOUT="$2"; shift 2;;
 		--recover) DO_RECOVER=1; shift;;
 		--no-ssh) USE_SSH=0; shift;;
+		--no-wan) NO_WAN=1; shift;;               # factory SOP: WAN unplugged, no Auto_Master
+		--factory-cgi) CHECK_FACTORY_CGI=1; shift;;
 		-h|--help) grep '^#' "$0" | sed 's/^# \?//'; exit 0;;
 		*) echo "Unknown arg: $1"; exit 2;;
 	esac
@@ -93,9 +108,27 @@ web_ok() {
 }
 
 SSH_OPTS="-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=6 -o LogLevel=ERROR"
+
+# In NO_WAN (factory SOP) mode Auto_Master never runs, so the admin/root password
+# stays "admin" instead of becoming the default passphrase. Which one is live
+# depends on the mode, so try each and cache whichever authenticates.
+SSH_PASS_OK=""
 dut_ssh() {
 	# runs remote command, echoes output; needs SSH_PASS
-	sshpass -p "$SSH_PASS" ssh $SSH_OPTS "$SSH_USER@$DUT_IP" "$1" 2>&1
+	if [ -n "$SSH_PASS_OK" ]; then
+		sshpass -p "$SSH_PASS_OK" ssh $SSH_OPTS "$SSH_USER@$DUT_IP" "$1" 2>&1
+		return
+	fi
+	local p out
+	for p in $([ "$NO_WAN" -eq 1 ] && echo "admin $SSH_PASS" || echo "$SSH_PASS admin"); do
+		out=$(sshpass -p "$p" ssh $SSH_OPTS "$SSH_USER@$DUT_IP" "$1" 2>&1)
+		if ! echo "$out" | grep -qiE 'permission denied|authentication fail'; then
+			SSH_PASS_OK="$p"
+			echo "$out"
+			return
+		fi
+	done
+	echo "$out"
 }
 have_ssh() { [ "$USE_SSH" -eq 1 ] && [ -n "$SSH_PASS" ]; }
 
@@ -117,6 +150,31 @@ log_lighttpd_state() {
 		return 0
 	fi
 	bad "  [$tag] lighttpd: NOT RUNNING (proc=$proc, listen80/443=$listen, status='${st}')"
+	return 1
+}
+
+# Factory-SOP check: GET /factory.cgi and confirm the Born-On status is "Idle".
+# factory.cgi is a small shell CGI that prints Born-On state from uci `dbon.bootstatus`:
+#   success=1 -> "Success", success=-1 -> "Failure", running=1 -> "Running", else "Idle".
+# A factory reset wipes /etc/config/dbon, and etc/uci-defaults/dbon.defaults recreates it
+# with running=0/success=0 -> so post-reset the SOP expects "Idle".
+# This also doubles as a real end-to-end web check: it exercises lighttpd's CGI handler,
+# not just the TCP socket.
+check_factory_cgi() {
+	local tag="$1" body status
+	body=$(curl -sk -m 8 "https://$DUT_IP/factory.cgi" 2>/dev/null)
+	[ -z "$body" ] && body=$(curl -s -m 8 "http://$DUT_IP/factory.cgi" 2>/dev/null)
+	if [ -z "$body" ]; then
+		bad "  [$tag] factory.cgi: NO RESPONSE (web/CGI down)"
+		return 1
+	fi
+	# last non-empty line is the status word
+	status=$(echo "$body" | grep -vE '^\s*$|-----' | tail -1 | tr -d '\r' | tr -d ' ')
+	if [ "$status" = "Idle" ]; then
+		ok "  [$tag] factory.cgi Born-On status: 'Idle' (expected after factory reset)"
+		return 0
+	fi
+	bad "  [$tag] factory.cgi Born-On status: '$status' (SOP expects 'Idle' after reset)"
 	return 1
 }
 
@@ -150,9 +208,12 @@ jnap_factory_reset() {
 # across https then http, and accept the first "result":"OK". SSH jffs2reset is the
 # last-resort fallback.
 trigger_factory_reset() {
-	local out scheme pass
+	local out scheme pass pwlist
+	# no-WAN: unit never leaves unconfigured mode, so "admin"/no-auth is the norm — try
+	# those first. With WAN, Auto_Master applies the master passphrase, so try that first.
+	if [ "$NO_WAN" -eq 1 ]; then pwlist="admin $JNAP_PASS"; else pwlist="$JNAP_PASS admin"; fi
 	for scheme in https http; do
-		for pass in "$JNAP_PASS" "admin" ""; do
+		for pass in $pwlist ""; do
 			out=$(jnap_factory_reset "$scheme" "$pass")
 			if jnap_result_ok "$out"; then
 				log "  JNAP FactoryReset accepted ($scheme, pw='${pass:-<none>}'): $(echo "$out" | tr -d '\n' | head -c 120)"
@@ -207,6 +268,23 @@ wait_reboot() {
 # completed. So before verifying web / doing the next reset we GATE on that here.
 # Needs SSH. Without SSH we can only fixed-wait (best effort).
 wait_auto_master() {
+	# Factory SOP (--no-wan): the WAN cable is unplugged, so Auto_Master never runs at
+	# all — the unit stays UNCONFIGURED (smart_mode.mode=0) and the admin/web password
+	# stays "admin" permanently. There is nothing to wait for; gating here would just
+	# burn AM_TIMEOUT every iteration. Report the unconfigured state and move on.
+	if [ "$NO_WAN" -eq 1 ]; then
+		if have_ssh; then
+			local mode pw
+			mode=$(dut_ssh "uci -q get linksys.smart_mode.mode" | tr -d '\r\n')
+			pw=$(dut_ssh   "uci -q get lsadmin.user.password"   | tr -d '\r\n')
+			info "  no-WAN mode: Auto_Master not expected to run (mode='${mode:-?}' pw='${pw:-?}')"
+			[ -n "$mode" ] && [ "$mode" != "0" ] && \
+				log "  ${C_YEL}note: mode=$mode though WAN is unplugged — unit is NOT unconfigured${C_RST}"
+		else
+			info "  no-WAN mode: skipping Auto_Master gate (unit stays unconfigured, pw='admin')"
+		fi
+		return 0
+	fi
 	if ! have_ssh; then
 		log "  (no SSH) can't read auto-master state; fixed wait ${AM_TIMEOUT}s for it to settle"
 		sleep "$AM_TIMEOUT"
@@ -314,6 +392,13 @@ info "======================================================================"
 info " LinksysWRT #451 web-GUI-after-factory-reset reproduction test"
 info " DUT=$DUT_IP  iterations=$ITERATIONS  boot_wait=${BOOT_WAIT}s am_wait=${AM_TIMEOUT}s"
 info " ssh=$([ "$USE_SSH" -eq 1 ] && echo on || echo off) recover=$DO_RECOVER  master_pw='$JNAP_PASS' (unconfigured pw='admin')"
+if [ "$NO_WAN" -eq 1 ]; then
+	info " MODE: no-WAN (factory Born-On SOP) — Auto_Master will NOT run; unit stays"
+	info "       unconfigured (mode=0) and the web/admin password stays 'admin'."
+else
+	info " MODE: WAN present — Auto_Master expected to promote unit to master."
+fi
+[ "$CHECK_FACTORY_CGI" -eq 1 ] && info " factory.cgi Born-On check: ENABLED (expect 'Idle' after each reset)"
 info " log: $RUN_LOG"
 info "======================================================================"
 
@@ -356,6 +441,8 @@ for i in $(seq 1 "$ITERATIONS"); do
 
 	if [ "$webup" -eq 1 ]; then
 		ok "iteration $i: web UI reachable (after ${w}s)"
+		# Factory SOP step: confirm Born-On status went back to 'Idle' after the reset.
+		[ "$CHECK_FACTORY_CGI" -eq 1 ] && check_factory_cgi "iter $i"
 	else
 		bad "iteration $i: web UI REFUSED after ${REACH_TIMEOUT}s  <<< BUG REPRODUCED"
 		FAIL_ITER=$i
