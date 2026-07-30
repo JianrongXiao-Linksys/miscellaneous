@@ -299,8 +299,30 @@ check_factory_cgi_jason() {
 		[ "$status" = "Idle" ] || bad "  [$tag] note: body is not 'Idle' (their tool does not check this)"
 		return 0
 	fi
+	local why
+	why=$(echo "$body" | tr -d '\n' | head -c 160)
 	bad "  [$tag] factory.cgi CURL_EXIT_CODE=$rc (refused/timeout) <<< the reporter's failure"
-	log  "  [$tag] curl said: $(echo "$body" | tr -d '\n' | head -c 160)"
+	log  "  [$tag] curl said: $why"
+
+	# Discriminate the ERRNO. #451 is a LIVE device whose lighttpd is not listening,
+	# which gives ECONNREFUSED ("Connection refused"). EHOSTUNREACH/ENETUNREACH
+	# ("No route to host" / "Network is unreachable") means the L2/L3 path to the DUT
+	# was not ready — on a dual-homed host with both links on 192.168.1.0/24 this is
+	# routine for ~10-20s after the Wi-Fi client re-associates, and it is NOT the bug.
+	if echo "$why" | grep -qE 'No route to host|Network is unreachable'; then
+		bad "  [$tag] ERRNO is EHOSTUNREACH, not ECONNREFUSED — the path was not ready, not #451."
+		log  "  [$tag] confirming on a settle-and-retry (and on the other link if any)..."
+		sleep 15
+		local rbody rrc
+		rbody=$(curl -k -sS $(curl_iface) --connect-timeout 5 --max-time 15 \
+			-H "Authorization:Basic $auth" "https://$DUT_IP/factory.cgi" 2>&1)
+		rrc=$?
+		if [ "$rrc" -eq 0 ]; then
+			ok "  [$tag] retry after 15s succeeded — CONFIRMED path artifact, iteration counts as PASS."
+			return 0
+		fi
+		bad "  [$tag] retry also failed (rc=$rrc): $(echo "$rbody" | tr -d '\n' | head -c 120)"
+	fi
 	return 1
 }
 

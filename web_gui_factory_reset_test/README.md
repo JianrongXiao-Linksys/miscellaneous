@@ -175,6 +175,29 @@ differently:
   returning an unexpected body would *pass* for them. We log both, and still note when
   the body is not `Idle`.
 
+### ERRNO discrimination — why curl exit 7 alone is not enough
+
+curl exit code **7 covers two very different failures**, and only one of them is #451:
+
+| ERRNO | curl text | Meaning | #451? |
+|---|---|---|---|
+| `ECONNREFUSED` | `Connection refused` | Packet reached the DUT; nothing is listening on :443 → **lighttpd is dead** | **Yes** |
+| `EHOSTUNREACH` / `ENETUNREACH` | `No route to host` / `Network is unreachable` | The packet never left / ARP unresolved → **the client's path was not ready** | No |
+
+On a dual-homed test PC (wired **and** Wi-Fi both on `192.168.1.0/24`, as the reporter's
+setup requires) the Wi-Fi client re-associates after every reset, and for a short window
+after the DHCP lease the neighbour entry for `192.168.1.1` on that link is not yet
+resolved. A `factory.cgi` GET fired in that window fails with `EHOSTUNREACH` in ~250 ms —
+while ping (already warm on the wired link, or satisfied moments earlier) still reports UP.
+That is exactly the "ping OK but curl fails" pattern of the bug, with a completely
+different cause.
+
+The tool therefore checks the ERRNO text: on `EHOSTUNREACH`/`ENETUNREACH` it settles 15 s
+and retries once, and a successful retry is recorded as a **PASS with an explicit
+"path artifact" note**. Only a persistent failure — or `Connection refused` — is scored as
+a reproduction. Since the reporter's tool judges the exit code alone, some of its
+"4th–5th reset" failures may be this artifact rather than the lighttpd start race.
+
 ### Usage (matching the reporter's topology)
 
 ```bash
