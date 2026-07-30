@@ -137,6 +137,10 @@ while [ $# -gt 0 ]; do
 		--grace) FF_GRACE="$2"; shift 2;;
 		--extra-pass) EXTRA_PASS="$EXTRA_PASS $2"; shift 2;;
 		--jason-flow) JASON_FLOW=1; NO_WAN=1; CHECK_FACTORY_CGI=1; shift;;
+		# Our units can take longer than the doc's 90s to drop off after an accepted
+		# reset (measured 121s), which aborts the run before it can even start. This
+		# overrides doc 4.3's timeout; any deviation is printed in the banner.
+		--jf-down-timeout) JF_DOWN_TIMEOUT="$2"; shift 2;;
 		--iface) IFACE="$2"; shift 2;;
 		--ssid) WIFI_SSID="$2"; shift 2;;
 		-h|--help) grep '^#' "$0" | sed 's/^# \?//'; exit 0;;
@@ -604,6 +608,7 @@ if [ "$JASON_FLOW" -eq 1 ]; then
 	info " JASON-FLOW: replicating FactoryResetConnectionStressTest.txt verbatim."
 	info "   reset via POST http://$DUT_IP/JNAP/ (:80), require \"result\":\"OK\" + DeviceRestart"
 	info "   down: ${JF_DOWN_FAILS} failed pings / ${JF_DOWN_TIMEOUT}s -> wait ${JF_AFTER_DOWN}s"
+	[ "$JF_DOWN_TIMEOUT" -ne 90 ] && info "   ${C_YEL}NOTE: disconnect timeout raised from the doc's 90s to ${JF_DOWN_TIMEOUT}s (our units can take ~121s).${C_RST}"
 	info "   up:   ${JF_UP_OKS} good pings / ${JF_UP_TIMEOUT}s (retry ${JF_UP_RETRY}s after Wi-Fi reconnect)"
 	info "   then wait ${JF_AFTER_UP}s -> factory.cgi (exit-code check only) -> wait ${JF_CYCLE_WAIT}s"
 	info "   path: ${IFACE:-default route (wired)}${WIFI_SSID:+  ssid=$WIFI_SSID}"

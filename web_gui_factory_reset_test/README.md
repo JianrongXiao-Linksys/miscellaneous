@@ -130,6 +130,7 @@ cd /home/jianrong/code/claude/miscellaneous/web_gui_factory_reset_test
 #   --factory-flow  our aggressive timing: next reset on first ping (implies the two above)
 #   --grace N       seconds after ping before the factory checks (default 10)
 #   --jason-flow    the reporter's own documented sequence, verbatim (see below)
+#   --jf-down-timeout N  raise the doc's 90s disconnect window (our units need up to ~140s)
 #   --iface IF      bind pings + curl to this interface (reporter ran the loop over Wi-Fi)
 #   --ssid SSID     SSID to reconnect to on a ping timeout (the doc 4.5 retry path)
 #   --extra-pass P  add another per-unit default_passphrase candidate
@@ -182,6 +183,14 @@ nmcli device wifi connect Linksys00002 password '<passphrase>' ifname wlp0s20f3
 
 ./reset_web_test.sh -i 192.168.1.1 -p '<passphrase>' -n 20 --jason-flow \
     --iface wlp0s20f3 --ssid Linksys00002 --no-ssh
+```
+
+A 20-cycle run takes ~80 minutes, so wrap it in `systemd-inhibit` — a host suspend
+mid-loop silently kills the run and looks like an unexplained stall in the log:
+
+```bash
+systemd-inhibit --what=sleep:idle:handle-lid-switch --why="451 stress test" \
+    ./reset_web_test.sh ... &
 ```
 
 ### Firmware note
