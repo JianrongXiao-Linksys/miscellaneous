@@ -1,5 +1,13 @@
 # Kernel panic — cnss_register_subsys BUG during factory-reset stress
 
+> **Update 2026-08-08 — also reproduces on CF.** With `cnss2.skip_cnss=1` rolled
+> back, firmware **1.2.3.26080709 (`build_target=CF`, M60CF-EU)** panicked on
+> **iteration 2** of `reset_web_test.sh --factory-flow`, same `main.c:5868`, same
+> `modprobe`/`init_ath_ahb_3_0` call path. That run reported
+> `r5 = fffffff4` = **-ENOMEM**, where the capture below reports
+> `r5 = fffffffe` = **-ENOENT** — so the `rproc_boot()` error value **varies between
+> runs**. Details: `repro_cf_20260808.md`.
+
 ## Summary
 
 Repeated factory reset via the network API triggers a **kernel BUG in the Qualcomm
