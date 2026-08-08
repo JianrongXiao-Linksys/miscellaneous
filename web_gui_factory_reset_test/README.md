@@ -13,31 +13,36 @@ reset) leaves the DUT in a state where:
 - the web UI returns **Connection Refused** on both browser and `curl` (curl code 7),
 - and it never recovers on its own, even after long waiting.
 
-## Root cause (confirmed against `pinnacle/develop` source)
+## Failure mechanism (proven) vs first cause (still open)
 
 The web server is **lighttpd** (`/usr/sbin/lighttpd`, serves `:80` redirect→`:443`,
-JNAP + CGI).
+JNAP + CGI). Feed source: `qsdk/qca/feeds/packages/net/lighttpd/files/lighttpd.init`
+(`START=50`, `USE_PROCD=1`).
 
-- lighttpd is **NOT enabled at boot** — there is *no* `rc.d` `S*` symlink, so procd
-  does not start it on boot. (Verified: `etc/rc.d/` has no `*lighttpd*` entry;
-  init script has `START=50` but is never `enable`d.)
-- Its **only** start trigger is the one-shot LAN ifup hotplug
-  `/etc/hotplug.d/iface/50-lighttpd`, which runs `/etc/init.d/lighttpd start` when
-  `ACTION=ifup && INTERFACE=lan`.
-- If that single start is missed or fails on a given boot, **nothing re-triggers it**
-  until the next LAN ifup — which only a power cycle provides. Ping keeps working
-  because ICMP is kernel-side, independent of lighttpd.
-- `curl`/JNAP **cannot** self-recover: they all talk to the dead lighttpd (catch-22).
+**Mechanism (PROVEN).** `start_service()` runs `validate_conf || exit 1` *before*
+`procd_open_instance`. That is the only fatal exit on the path, and when it trips the
+service leaves **no procd instance, no `/var/log/lighttpd/error.log`, and no
+respawn** — exactly the observed state. Ping keeps working because ICMP is
+kernel-side. `curl`/JNAP cannot self-recover: they all talk to the dead lighttpd
+(catch-22). A manual `/etc/init.d/lighttpd start` brings it all back.
 
-Factory console capture confirmed the smoking gun: in the failed state
-`lighttpd -tt` returns **exit 0 (config VALID)**, there is **no lighttpd process**,
-`:80`/`:443` are **not LISTENing**, and `/var/log/lighttpd/error.log` **does not
-exist** (start_service never ran this boot). A manual `/etc/init.d/lighttpd start`
-brings it all back — proving the start was simply *missing*, not broken config.
+**Two earlier claims in this README were wrong and have been removed:**
 
-**Proper firmware fix:** enable lighttpd at boot (ship the `rc.d` enable symlink /
-`enable`) so procd starts+respawns it, and/or make `50-lighttpd` idempotent with a
-retry independent of a single ifup event.
+- ~~"lighttpd is not enabled at boot; only the LAN-ifup hotplug starts it"~~ —
+  `/etc/rc.d/` ships **both** `S50lighttpd` and `K50lighttpd`. It *is* a boot service.
+- ~~"cert generation races S50lighttpd"~~ — `uci_apply_defaults()` in
+  `/etc/init.d/boot` (`START=10`) is synchronous and finishes before `S20network`
+  and `S50lighttpd`; `/etc/uci-defaults` is fully consumed.
+
+**Still open:** *why* `start_service` failed on the first boot that broke. It never
+reaches syslog, so it needs a serial capture of that boot.
+
+**The real delta in the April production image is RECOVERY, not the first failure.**
+That build lacks `/etc/hotplug.d/iface/50-lighttpd`, so a failed `S50lighttpd` had
+**zero** retrigger ⇒ web dead until power cycle. The handler was added 2026-05-12
+(`d6c7c15`, `qsdk-spf12.5_csu1/sdk_patches/3027_lighttpd-hotplug-bridge-handler.patch`).
+SDK14 fixed it properly instead — Architecture issue **#171**, moving cert generation
+into `start_service()`/`reload_service()` and adding respawn — **not backported to 12.5**.
 
 ## Post-reset device state (important for the test logic)
 
@@ -273,6 +278,72 @@ Auto_Master completes — which the tool gates past, so it never needs it.
 
 Exit code `1` = bug reproduced (or DUT unreachable); `0` = all N resets recovered.
 
+## `qca_skipcnss_stress.sh` — QCA case 08621084 (kernel panic, separate issue)
+
+A **second, unrelated** defect surfaced on the same reset loop: some boots panic with
+`kernel BUG at qca-cnss-local/main.c:5868` in `cnss_register_subsys+0x2ec/0x378`,
+reached via `modprobe wifi_3_0` → `pld_register_driver` → `cnss_wlan_probe_driver`.
+Line 5868 is `CNSS_ASSERT(0)` on the `rproc_boot()` failure path, and `r5 = fffffffe`
+in the register dump is that return value = **-ENOENT** (the case subject says
+-ENOMEM; that is wrong). Escalated to Qualcomm as **case 08621084**.
+
+`qca_skipcnss_stress.sh` implements the debug procedure QCA asked for, deliberately
+kept separate from `reset_web_test.sh`:
+
+| QCA step | Implementation |
+|---|---|
+| 1 — boot arg `cnss2.skip_cnss=1` | set out-of-band with `fw_setenv` (see below); the script *verifies* it every iteration |
+| 2 — console capture | `serial_console_log.py`, or `minicom` |
+| 3 — 15 reset iterations | reset via JNAP → wait offline → wait online → confirm SSH **and** HTTP/HTTPS → wait **10 s** → next |
+| 4 — watch for `overlayfs` / `-116` | `dmesg` pulled after every iteration and scanned for `overlayfs`, `ESTALE`, `-116` |
+| 5 — `jffs2reset -y` on a hit | automatic (`AUTO_JFFS2RESET=1`) |
+
+```bash
+./qca_skipcnss_stress.sh          # constants at the top: ITERATIONS, DOWN_WAIT, BOOT_WAIT, CYCLE_WAIT
+```
+
+Exit codes: `0` clean, `1` failure/abort, `2` incomplete, `3` an `overlayfs`/`-116` hit.
+
+The boot argument goes in the **U-Boot environment** (`u_env`, mtd20), so it survives
+both reboot *and* factory reset — the overlay is wiped every iteration, so an overlay
+based method would not last:
+
+```sh
+fw_setenv bootargs "console=ttyMSM0,115200n8 cnss2.enable_mlo_support=1 cnss2.skip_cnss=1"
+reboot
+# rollback: same command without the last token
+# verify:   cat /sys/module/ipq_cnss2/parameters/skip_cnss   # 1
+#           cat /sys/class/remoteproc/*/state                # all offline
+```
+
+No image rebuild is needed: `load_cnss2` parses `cnss2.*` tokens out of
+`/proc/cmdline` and passes them to `insmod ipq_cnss2`.
+
+**Caveat on the result.** `skip_cnss=1` keeps the WLAN driver from attaching at all,
+so Wi-Fi never comes up and the panicking path is never entered. A clean run under
+it is expected and does **not** show the panic is fixed — it only isolates the
+overlayfs question QCA wanted answered.
+
+## `serial_console_log.py` — timestamped console capture (QCA step 2)
+
+Writes `[HH:MM:SS.mmm +oooo.ooo] line` and live-flags `OVERLAYFS`, `ESTALE-116`,
+`PANIC`, and `RESET-REASON`. Needed because a panicking boot never gets far enough
+to answer SSH, so `dmesg` can never capture it.
+
+```bash
+sudo ./serial_console_log.py                       # /dev/ttyUSB0 @ 115200 → logs/console_<ts>.log
+sudo ./serial_console_log.py -d /dev/ttyUSB1 -b 115200
+```
+
+`sudo` is required — the device is `root:dialout`. Requires `pyserial`.
+
+## Reports
+
+- `crash/panic_cnss_register_subsys.md` — the panic, decoded, with questions for QCA
+- `crash/qca_skipcnss_run1_result.md` — full internal result of the `skip_cnss=1` run
+- `crash/qca_reply_console_log.md` — the trimmed, de-branded reply sent to QCA
+
 ## Dependencies
 
-`sshpass`, `curl`, `ping` (all present on this host). Logs are written to `./logs/`.
+`sshpass`, `curl`, `ping` (all present on this host); `pyserial` for
+`serial_console_log.py`. Logs are written to `./logs/`.

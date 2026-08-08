@@ -8,17 +8,29 @@
 #   - DUT still pings          (expected: always OK, ICMP is kernel-side)
 #   - DUT web UI :80 / :443    (bug: refused after ~4-5th consecutive reset)
 #
-# Root cause (confirmed against pinnacle/develop source + factory console capture):
-#   lighttpd (the web server) is NOT enabled at boot — there is no rc.d S-symlink.
-#   It is started ONLY by the one-shot LAN ifup hotplug /etc/hotplug.d/iface/50-lighttpd.
-#   If that single start is missed/fails on a boot, nothing retriggers it until the
-#   next LAN ifup, which only a power cycle provides. Ping keeps working because ICMP
-#   is independent of lighttpd. curl/JNAP cannot self-recover (they talk to the dead
-#   lighttpd — a catch-22).
+# Failure mechanism (proven) vs first cause (still open):
+#   PROVEN: lighttpd's init runs `validate_conf || exit 1` before registering with
+#   procd. If validation fails (e.g. ssl.pemfile missing => `lighttpd -tt` exits 255,
+#   "Initialization of plugins failed"), the service exits with NO procd instance, NO
+#   error.log and NO respawn. Ping keeps working because ICMP is kernel-side, and
+#   curl/JNAP cannot self-recover since they talk to the dead lighttpd (a catch-22).
 #
-# When this tool detects the failure it SSHes in and captures the smoking-gun state
-# (no lighttpd process, 80/443 not LISTEN, missing error.log, hotplug log) to prove
-# the root cause, then optionally recovers with `/etc/init.d/lighttpd start`.
+#   NOT the cause (checked and ruled out): lighttpd IS enabled at boot — /etc/rc.d
+#   has S50lighttpd and K50lighttpd. A cert-generation race was also ruled out: the
+#   cert and /var/*/lighttpd share the same mtime second and /etc/uci-defaults is
+#   fully consumed, with boot(10) ordered before lighttpd(50).
+#
+#   STILL OPEN: why start_service failed on the first boot that broke.
+#
+#   The real April-image delta is RECOVERY, not the first failure: that build has no
+#   /etc/hotplug.d/iface/50-lighttpd, so a failed S50lighttpd had zero retrigger and
+#   the unit stayed web-dead until a power cycle. The hotplug handler was added
+#   2026-05-12 (sdk_patches/3027_lighttpd-hotplug-bridge-handler.patch) and is in no
+#   release tag yet.
+#
+# When this tool detects the failure it SSHes in and captures the state (lighttpd
+# process, 80/443 LISTEN, `lighttpd -tt` exit code, error.log, rc.d symlinks,
+# hotplug handler presence) then optionally recovers with `/etc/init.d/lighttpd start`.
 #
 # Usage:
 #   ./reset_web_test.sh [-i DUT_IP] [-p SSH_PASS] [-u SSH_USER] [-n ITERATIONS]
@@ -577,10 +589,13 @@ diagnose_failure() {
 		echo "---- /var/log/lighttpd/error.log (expect: missing => never started this boot) ----"
 		dut_ssh "ls -l /var/log/lighttpd/error.log 2>&1; echo '--- tail ---'; tail -n 20 /var/log/lighttpd/error.log 2>&1"
 		echo
-		echo "---- boot rc.d symlink for lighttpd (expect: none => not enabled at boot) ----"
-		dut_ssh "ls -l /etc/rc.d/*lighttpd* 2>&1 || echo 'NO rc.d symlink (not enabled at boot)'"
+		echo "---- boot rc.d symlinks for lighttpd (expect: S50lighttpd + K50lighttpd) ----"
+		dut_ssh "ls -l /etc/rc.d/*lighttpd* 2>&1 || echo 'NO rc.d symlink -- NOT enabled at boot (abnormal)'"
 		echo
-		echo "---- lighttpd hotplug log (the only start trigger) ----"
+		echo "---- LAN-ifup recovery handler (absent on the April image; added 2026-05-12) ----"
+		dut_ssh "ls -l /etc/hotplug.d/iface/50-lighttpd 2>&1"
+		echo
+		echo "---- lighttpd log entries ----"
 		dut_ssh "logread 2>/dev/null | grep -i lighttpd | tail -n 20 || echo 'no lighttpd logread entries'"
 		echo
 		echo "---- LAN iface state ----"
@@ -589,10 +604,12 @@ diagnose_failure() {
 
 	cat "$dfile"
 
-	# Verdict: is this the known root cause?
+	# Verdict: does this match the known failure shape?
 	if grep -q 'NO lighttpd process' "$dfile" && grep -qE 'exit=0|valid' "$dfile"; then
-		bad "  ROOT CAUSE CONFIRMED: config VALID but lighttpd not running & 80/443 not listening."
-		bad "  => lighttpd never started this boot (single LAN-ifup hotplug trigger, no boot service)."
+		bad "  MATCHES the known shape: no lighttpd process, 80/443 not listening,"
+		bad "  yet the config validates NOW. => start_service exited before procd"
+		bad "  registration on this boot. Capture WHY from the console/serial log:"
+		bad "  validate_conf is the only fatal exit path before procd_open_instance."
 	fi
 
 	if [ "$DO_RECOVER" -eq 1 ]; then
