@@ -354,10 +354,10 @@ sudo ./serial_console_log.py -d /dev/ttyUSB1 -b 115200
 |---|---|
 | `logs/qca_skipcnss_20260808_112546.log` | run log of the 15-iteration loop (per-iteration timings, verdicts) |
 | `logs/qca_skipcnss_20260808_112546_dmesg.txt` | 16 `dmesg` snapshots (baseline + one per iteration), 480 KB |
-| `logs/serial_console_20260808_skipcnss_raw.log` | serial capture, all 16 `skip_cnss=1` boots — **internal only**, contains MAC/serial/UUID/credentials |
-| `logs/serial_console_20260808_skipcnss_for_qca.log` | the same capture, sanitized — this is the copy sent to QCA |
+| `logs/serial_console_20260808_skipcnss_INTERNAL_raw.log` | serial capture, all 16 `skip_cnss=1` boots — **internal only**, contains MAC/serial/UUID/credentials |
+| `logs/serial_console_20260808_skipcnss.log` | the same capture, sanitized — this is the copy sent to QCA |
 
-Send the `_for_qca` copy only. Sanitization masks host identifiers (`<MAC>`,
+Send `serial_console_20260808_skipcnss.log` only (the one without `INTERNAL` in the name). Sanitization masks host identifiers (`<MAC>`,
 `<SERIAL>`, `<UUID>`, `<HOSTNAME>`, `<SSID>`, `<REDACTED>`) and replaces
 vendor-proprietary log tags (`[Linksys][*]` → `[vendor][*]`, `[Auto_Master]` →
 `[provisioning]`); all kernel and driver messages are left verbatim. Verify before
@@ -365,7 +365,7 @@ sending:
 
 ```bash
 grep -ciE "8xPghzqdr|12345Asdf|74:12:13|67A10M24|linksys|Auto_Master" \
-    logs/serial_console_20260808_skipcnss_for_qca.log     # must print 0
+    logs/serial_console_20260808_skipcnss.log     # must print 0
 ```
 
 Note the earlier capture in `~/Downloads/08621084/` (`kp.log` plus `dump/` and
