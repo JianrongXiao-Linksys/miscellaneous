@@ -57,8 +57,12 @@ The Wi-Fi firmware partition still mounts normally under this setting:
 
 ## Step 2 — console capture
 
-Serial console captured from a Linux PC on `/dev/ttyMSM0` @ 115200 for the whole
-run (attached). Setup under test:
+Serial console captured from a Linux PC for the whole run and attached as
+**`serial_console_20260808_skipcnss.log`** — 21,530 lines covering all 16 boots
+under `skip_cnss=1`. Host-specific identifiers (MAC, serial, UUID, hostname,
+credentials) are masked; all kernel and driver messages are verbatim.
+
+Setup under test:
 
 | Item | Value |
 |---|---|
@@ -166,8 +170,8 @@ Two things we would like to confirm:
 
 ## Artifacts attached
 
-- serial console capture for the full run
-- 16 `dmesg` snapshots (baseline + per iteration)
+- `serial_console_20260808_skipcnss.log` — serial capture, all 16 boots of the run
+- 16 `dmesg` snapshots (baseline + one per iteration)
 - the loop script implementing steps 3–5
 
 Thanks,
