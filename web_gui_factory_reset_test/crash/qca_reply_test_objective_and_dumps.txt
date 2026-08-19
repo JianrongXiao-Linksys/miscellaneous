@@ -9,12 +9,18 @@ It is the first of your two options: overall endurance and stability across repe
 Background: the loop mirrors a manufacturing-line sequence. Each unit is factory reset and then re-provisioned, and it has to come back with the management interface and WLAN fully operational before the unit is accepted. The automated test reproduces that sequence back to back:
 
   1. trigger a factory reset through the device management API
-  2. wait for the unit to go offline
-  3. wait for it to answer ping again
-  4. confirm SSH and HTTP/HTTPS respond, and that the provisioning status endpoint answers
-  5. wait 10 s, then start the next cycle
+  2. wait for the unit to go offline (up to 150 s)
+  3. wait for it to answer ping again (up to 180 s)
+  4. wait a fixed 10 s grace period
+  5. HTTPS GET of the factory status endpoint, expecting "Idle"
+  6. a management API request on port 80
+  7. as soon as those answer, trigger the next reset
 
-15 to 30 cycles per run. The pass/fail criterion is therefore end to end: the unit must survive reset -> reboot -> full initialization (which includes CNSS and WLAN bring-up) -> services up. We do not measure module load ordering or init timing, and we never load or unload drivers by hand.
+15 to 30 cycles per run. The pass/fail criterion is end to end: the unit must survive reset -> reboot -> full initialization (which includes CNSS and WLAN bring-up) -> services responding. We do not measure module load ordering or init timing, and we never load or unload drivers by hand.
+
+One detail of the timing is worth calling out, because it is deliberate and it is likely relevant to you: step 4 waits only 10 s, and step 7 fires the next reset as soon as the two checks answer. We do not wait for initialization to complete. A reset can therefore arrive while CNSS and WLAN bring-up are still in progress. That is intentional, because it is what the production station does.
+
+We also run a second variant that follows the procedure you recommended earlier in this case: 15 iterations, SSH and HTTP/HTTPS confirmed on every cycle, and the kernel log scanned for overlayfs and -116 after each reset. The two panics reported here came from the production-timing variant above.
 
 The CNSS panic is not what this test was written to find. It surfaced as a side effect, and we are reporting it because the assert is fatal and the unit reboots.
 
