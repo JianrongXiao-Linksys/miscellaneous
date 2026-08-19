@@ -1,59 +1,27 @@
 Hi Pranjal,
 
-Answering both questions.
-
 1. TEST OBJECTIVE
 
-It is the first of your two options: overall endurance and stability across repeated factory resets, including CNSS/WLAN bring-up. It is not a study of how individual modules or drivers load during initialization.
+The first of your two options: overall endurance and stability across repeated factory resets, including CNSS/WLAN bring-up. It is not a study of how individual modules or drivers load — we never load or unload drivers by hand.
 
-Background: the loop mirrors a manufacturing-line sequence. Each unit is factory reset and then re-provisioned, and it has to come back with the management interface and WLAN fully operational before the unit is accepted. The automated test reproduces that sequence back to back:
+The loop mirrors our manufacturing-line sequence: factory reset through the device management API -> wait for the unit to drop off -> wait for ping -> 10 s grace -> check the factory status endpoint and a management API request on port 80 -> immediately trigger the next reset. 15 to 30 cycles per run.
 
-  1. trigger a factory reset through the device management API
-  2. wait for the unit to go offline (up to 150 s)
-  3. wait for it to answer ping again (up to 180 s)
-  4. wait a fixed 10 s grace period
-  5. HTTPS GET of the factory status endpoint, expecting "Idle"
-  6. a management API request on port 80
-  7. as soon as those answer, trigger the next reset
+The important timing detail: we deliberately do not wait for initialization to complete, so the next reset can arrive while CNSS and WLAN bring-up are still in progress. That is intentional, because it is what the production station does.
 
-15 to 30 cycles per run. The pass/fail criterion is end to end: the unit must survive reset -> reboot -> full initialization (which includes CNSS and WLAN bring-up) -> services responding. We do not measure module load ordering or init timing, and we never load or unload drivers by hand.
+Two observations that may help you scope the panic:
 
-One detail of the timing is worth calling out, because it is deliberate and it is likely relevant to you: step 4 waits only 10 s, and step 7 fires the next reset as soon as the two checks answer. We do not wait for initialization to complete. A reset can therefore arrive while CNSS and WLAN bring-up are still in progress. That is intentional, because it is what the production station does.
-
-We also run a second variant that follows the procedure you recommended earlier in this case: 15 iterations, SSH and HTTP/HTTPS confirmed on every cycle, and the kernel log scanned for overlayfs and -116 after each reset. The two panics reported here came from the production-timing variant above.
-
-The CNSS panic is not what this test was written to find. It surfaced as a side effect, and we are reporting it because the assert is fatal and the unit reboots.
-
-One correlation that may help you scope it: both panics in the last capture occurred on boots where the device configuration tree was empty or unreadable. The console shows a flood of "uci: Entry not found", "uci: I/O error", "Region= not found in list." and an empty SKU string before each panic. With no valid region/SKU/board parameters, board-data and regulatory selection have nothing valid to select, the CNSS error path is entered, and the assert fires. A factory reset, or a reset that does not complete cleanly, is what produces that state, which is why a reset loop is an effective trigger. From our point of view the reset loop is only the trigger; the defect is that CNSS calls CNSS_ASSERT() on these paths instead of returning an error to its caller.
-
-That distinction matters most for the second panic, because it is reached from userspace:
-
-  nl80211_vendor_cmd -> wlan_cfg80211_set_wificonfiguration -> wlan_cfg80211_set_params -> ol_ath_ucfg_setparam -> ol_ath_check_and_start_target -> ol_ath_target_start -> ol_ath_soc_start -> __cnss_subsystem_get -> BUG() at main.c:3609
-
-A normal userspace configuration command should not be able to panic the kernel, regardless of how the device got into that state.
+  - Both panics occurred on boots where the configuration tree was empty or unreadable ("uci: Entry not found", "Region= not found in list.", empty SKU). With no valid region/SKU/board parameters, board-data and regulatory selection have nothing valid to select, the CNSS error path is entered, and CNSS_ASSERT() fires. The reset loop is only the trigger; the defect is the assert on a recoverable path.
+  - The second panic is reached from userspace: nl80211_vendor_cmd -> wlan_cfg80211_set_wificonfiguration -> wlan_cfg80211_set_params -> ol_ath_ucfg_setparam -> ol_ath_check_and_start_target -> ol_ath_target_start -> ol_ath_soc_start -> __cnss_subsystem_get -> BUG() at main.c:3609. A userspace configuration command should not be able to panic the kernel.
 
 2. DUMPS
 
-Available now, complete. This is the pre-patch panic at main.c:5868, PC at cnss_register_subsys, t = 38.7 s, captured 2026-07-28:
+Complete and ready to send, for the pre-patch panic at main.c:5868 (cnss_register_subsys, t = 38.7 s), captured 2026-07-28: EBICS0.BIN (536,870,912 bytes), IMEM.BIN, IMEM2.BIN, kp.log, vmlinux and vmlinux.debug, plus the matching modules (ipq_cnss2.ko, qca_ol.ko, qdf.ko, wifi_3_0.ko, mem_manager.ko, qca_spectral.ko, smart_antenna.ko, telemetry_agent.ko). About 813 MB, too large for a case attachment, so please send an upload link.
 
-  EBICS0.BIN     536,870,912 bytes (complete)
-  IMEM.BIN             4,096 bytes
-  IMEM2.BIN            4,096 bytes
-  kp.log                     full console capture for that crash
-  vmlinux, vmlinux.debug     our build matching that image
-  modules                    ipq_cnss2.ko, qca_ol.ko, qdf.ko, wifi_3_0.ko, mem_manager.ko, qca_spectral.ko, smart_antenna.ko, telemetry_agent.ko
+Incomplete, for the two panics on the CL_7200283 image (qmi/qmi.c:1735 and main.c:3609): a network problem interrupted the TFTP transfer, so EBICS0.BIN arrived at 49,989,120 of 536,870,912 bytes (9.3 percent) and the IMEM files were never transferred. We will re-capture on a clean link and send both sets. The serial console log we already shared is unaffected and remains the authoritative record of the two call stacks. Note that CL_7200283 removes the assert on the rproc_boot() path only, so neither of these two sites was covered, and both still panic with cnss2.skip_cnss not set.
 
-About 813 MB in total, which will not fit as a case attachment. Please tell us where to upload it, or send an upload link, and we will push it straight away.
+Two questions:
 
-Not complete yet: the two panics on the CL_7200283 debug image, qmi/qmi.c:1735 (cnss_wlfw_bdf_dnld_send_sync) and main.c:3609 (__cnss_subsystem_get). Note that CL_7200283 removes the assert on the rproc_boot() failure path only, so neither of these two sites was covered by it, and both still panic with cnss2.skip_cnss not set.
-
-For those two the crashdump was not captured in full, because of a network problem on our collection setup during the TFTP transfer. What landed on the collection host is EBICS0.BIN at 49,989,120 of the expected 536,870,912 bytes, that is 9.3 percent, and the IMEM files were never transferred at all. We are not presenting that as a usable dump. If your tooling can work with a partial DDR image starting at the DDR base address, tell us and we will upload the 50 MB fragment, since the kernel text, data and log buffer should all be inside it.
-
-We will re-capture these two on a clean, dedicated link and send you the complete set for both signatures as soon as we have it. The serial console log for both panics, which we already shared, is unaffected by the transfer problem and remains the authoritative record of the two call stacks.
-
-Two questions that would help:
-
-  - Does this platform support writing the crashdump to flash instead of TFTP, or any other collection method that does not depend on the network? A 512 MB image over TFTP is the fragile step in our setup.
-  - Would a minidump be sufficient for these two signatures, or do you need the full DDR image in both cases?
+  - Can the crashdump be written to flash instead of TFTP, or collected in any way that does not depend on the network? 512 MB over TFTP is the fragile step in our setup.
+  - Is a minidump sufficient for these two signatures, or do you need the full DDR image?
 
 Best regards,
