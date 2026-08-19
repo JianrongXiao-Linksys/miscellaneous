@@ -39,15 +39,15 @@ Available now, complete. This is the pre-patch panic at main.c:5868, PC at cnss_
 
 About 813 MB in total, which will not fit as a case attachment. Please tell us where to upload it, or send an upload link, and we will push it straight away.
 
-Not available yet: the two panics on the CL_7200283 debug image, qmi/qmi.c:1735 (cnss_wlfw_bdf_dnld_send_sync) and main.c:3609 (__cnss_subsystem_get). Note that CL_7200283 removes the assert on the rproc_boot() failure path only, so neither of these two sites was covered by it, and both still panic with cnss2.skip_cnss not set.
+Not complete yet: the two panics on the CL_7200283 debug image, qmi/qmi.c:1735 (cnss_wlfw_bdf_dnld_send_sync) and main.c:3609 (__cnss_subsystem_get). Note that CL_7200283 removes the assert on the rproc_boot() failure path only, so neither of these two sites was covered by it, and both still panic with cnss2.skip_cnss not set.
 
-For those two, the crashdump TFTP transfer was interrupted. What landed on the collection host is EBICS0.BIN at 49,989,120 of the expected 536,870,912 bytes, that is 9.3 percent, and the IMEM files were never re-uploaded. That is not a usable full dump, so we are not presenting it as one. If your tooling can work with a partial DDR image starting at the DDR base address, tell us and we will upload the 50 MB fragment, since the kernel text, data and log buffer should all be inside it.
+For those two the crashdump was not captured in full, because of a network problem on our collection setup during the TFTP transfer. What landed on the collection host is EBICS0.BIN at 49,989,120 of the expected 536,870,912 bytes, that is 9.3 percent, and the IMEM files were never transferred at all. We are not presenting that as a usable dump. If your tooling can work with a partial DDR image starting at the DDR base address, tell us and we will upload the 50 MB fragment, since the kernel text, data and log buffer should all be inside it.
 
-We will re-capture properly. Plan: reflash the CL_7200283 image, keep the serial console recording through the whole dump so we can see why the transfer aborts, and hold all other traffic off the unit during the dump window. We will send the complete set for both signatures as soon as we have it.
+We will re-capture these two on a clean, dedicated link and send you the complete set for both signatures as soon as we have it. The serial console log for both panics, which we already shared, is unaffected by the transfer problem and remains the authoritative record of the two call stacks.
 
-Two questions that would speed that up:
+Two questions that would help:
 
-  - Is there a U-Boot setting on this platform that makes the crashdump upload more robust, or that writes the dump to flash instead of TFTP? The full 512 MB over TFTP takes several minutes and something is cutting it short after roughly 20 seconds.
+  - Does this platform support writing the crashdump to flash instead of TFTP, or any other collection method that does not depend on the network? A 512 MB image over TFTP is the fragile step in our setup.
   - Would a minidump be sufficient for these two signatures, or do you need the full DDR image in both cases?
 
 Best regards,
