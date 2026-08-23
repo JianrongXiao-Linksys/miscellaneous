@@ -216,10 +216,16 @@ ctrl_verdict() {
 }
 
 wait_online() {
-	local dir="$1" waited=0 up="" next_report="$POLL_REPORT" verdict
+	local dir="$1" waited=0 up="" next_report="$POLL_REPORT" verdict start
+	# Wall clock, not a count of poll intervals. Each iteration also spends an ssh -- up to
+	# ConnectTimeout when the agent is unreachable, which is every iteration of a failing round --
+	# so `waited += POLL` undercounts badly: 26082222 r9 printed "...40s" at what was really
+	# 81 s by the controller's own uptime, and DEADLINE=300 would have meant nearer 10 minutes.
+	# A progress number that is not seconds cannot be compared with the [t=] axis at all.
+	start="$(date +%s)"
 	while [ "$waited" -lt "$DEADLINE" ]; do
 		sleep "$POLL"
-		waited=$((waited + POLL))
+		waited=$(( $(date +%s) - start ))
 		if up="$(agent_online)"; then
 			say "agent online after ${waited}s of waiting (host clock $(date '+%H:%M:%S'), agent uptime ${up})"
 			# Handed to timeline() through the artefact dir rather than a variable: the
@@ -231,7 +237,10 @@ wait_online() {
 		if [ "$waited" -ge "$next_report" ]; then
 			verdict="$(ctrl_verdict)"
 			say "  ...${waited}s, agent not online yet (controller: ${verdict:-unreadable})"
-			next_report=$((next_report + POLL_REPORT))
+			# From `waited`, not from the old boundary: with a wall clock one iteration can
+			# cross several boundaries, and stepping by POLL_REPORT would then report every
+			# iteration until it caught up.
+			next_report=$((waited + POLL_REPORT))
 			# Fail fast on the controller's own verdict. 26082220 r8 burned the whole
 			# 300 s DEADLINE on a round the controller had already given up on at 36 s
 			# ("0 succeeded, 1 failed", the GATT connect never landed) -- 4 minutes of
@@ -267,13 +276,42 @@ wait_online() {
 # the DUT boots with an unsynced clock (dates in the past) and jumps forward mid-onboard when
 # NTP lands, so a wall-clock sort interleaves lines from before and after the jump.
 
+# Where to reach the agent for a harvest, echoed as an IP, or empty if it cannot be reached.
+#
+# On a FAILED round the agent is not at $AGENT_DHCP_IP -- it never got a lease -- it is
+# unconfigured at 192.168.1.1 behind the other NIC. Harvesting without this fallback produced
+# 26082222 r9's artefact dir: four files, three of them zero bytes, and the whole agent side of
+# the failure (the wps_pbc error that was the actual root cause) had to be read off the box by
+# hand afterwards. The failed rounds are the ones whose logs matter most.
+#
+# The MAC guard is not optional here: on the agent NIC, 192.168.1.1 is whichever node answers,
+# and harvesting the controller into agent-*.txt would be worse than harvesting nothing.
+agent_harvest_ip() {
+	[ -n "$(mac_of "$AGENT_DHCP_IP")" ] && { printf '%s' "$AGENT_DHCP_IP"; return 0; }
+	nic agent >/dev/null
+	[ "$(mac_of "$CTRL_IP")" = "$AGENT_MAC" ] && { printf '%s' "$CTRL_IP"; return 0; }
+	return 1
+}
+
 harvest() {
-	local dir="$1"
+	local dir="$1" aip
 	mkdir -p "$dir"
+	# The controller first, while its NIC is the live one: agent_harvest_ip may switch away.
+	dsh "$CTRL_IP" 'logread | grep -iE "ble-onboard|onboard"' | redact > "$dir/ctrl-onboard.txt"
+	scp "${SSH_OPTS[@]}" -q "root@$CTRL_IP:/tmp/log/messages.1.gz" "$dir/ctrl-messages.1.gz" 2>/dev/null
+	if ! aip="$(agent_harvest_ip)"; then
+		say "WARNING: the agent answers on neither $AGENT_DHCP_IP nor $CTRL_IP -- no agent-side evidence for this round"
+		return 0
+	fi
+	[ "$aip" = "$AGENT_DHCP_IP" ] || say "agent harvested at $aip (unconfigured -- this round did not onboard)"
+	AGENT_DHCP_IP="$aip" harvest_agent "$dir"
+}
+
+harvest_agent() {
+	local dir="$1"
 	dsh "$AGENT_DHCP_IP" 'logread'                | redact > "$dir/agent-logread.txt"
 	dsh "$AGENT_DHCP_IP" 'cat /tmp/wifi-monitor.log' | redact > "$dir/wifi-monitor.log"
 	scp "${SSH_OPTS[@]}" -q "root@$AGENT_DHCP_IP:/tmp/log/messages.1.gz" "$dir/messages.1.gz" 2>/dev/null
-	dsh "$CTRL_IP" 'logread | grep -iE "ble-onboard|onboard"' | redact > "$dir/ctrl-onboard.txt"
 	dsh "$AGENT_DHCP_IP" 'echo "-- bhsta --"
 	    wpa_cli -p /var/run/wpa_supplicant -i $(uci -q get wireless.bhsta.ifname) status 2>/dev/null \
 	        | grep -E "^(wpa_state|bssid|freq)="

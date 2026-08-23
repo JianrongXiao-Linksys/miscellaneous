@@ -145,6 +145,18 @@ recovered from `messages.1.gz` instead of `logread`. Only `failed` is terminal �
 success result arrives well before the agent has a route, so treating `done` alone as the end
 would abort every good round.
 
+**Progress seconds are wall clock.** They used to be a count of poll intervals, which undercounts
+by however long each probe's ssh took — and on a failing round every probe waits out
+`ConnectTimeout`. 26082222 r9 printed `...40s` at a moment the controller's own uptime put at 81 s,
+so `DEADLINE=300` really meant closer to ten minutes. The headline number was never affected (it
+comes from the agent's `/proc/uptime`), but the progress lines and `DEADLINE` now mean seconds.
+
+**A failed round is harvested from the other NIC.** An agent that did not onboard has no lease, so
+it is not at `192.168.1.111`; it is unconfigured at `192.168.1.1` behind `AGENT_NIC_CONN`. The
+harvest falls back there, MAC-guarded, and says so. Without that fallback, r9's artefact dir was
+four files with three of them empty — and the failed rounds are exactly the ones whose logs matter.
+The controller side (including its `messages.1.gz`) is pulled first, while its NIC is still up.
+
 ## Reading the clock — three log sources, and why
 
 No single source survives a whole round.
