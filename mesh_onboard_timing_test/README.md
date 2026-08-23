@@ -136,6 +136,15 @@ seconds before harvesting. Harvesting on the online edge cut one 26082217 artefa
 and lost a bSTA drop at `t=237`: the saved logs said the round ended clean, and the live log read
 minutes later said it had not.
 
+**A failed round aborts on the controller's verdict, not on `DEADLINE`.** Every progress line now
+carries `onboarding::state`, `onboarding::result` and `onboarding::counters` read from the
+controller, and `state=done` with `result=failed` ends the round immediately. This matters twice
+over: 26082220 r8 spent the full 300 s polling an agent the controller had already given up on at
+36 s, and those extra four minutes of syslog churn are why that round's evidence had to be
+recovered from `messages.1.gz` instead of `logread`. Only `failed` is terminal — `done` with a
+success result arrives well before the agent has a route, so treating `done` alone as the end
+would abort every good round.
+
 ## Reading the clock — three log sources, and why
 
 No single source survives a whole round.

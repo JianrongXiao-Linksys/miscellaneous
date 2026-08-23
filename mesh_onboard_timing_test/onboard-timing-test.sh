@@ -203,8 +203,20 @@ agent_online() {
 	return 1
 }
 
+# The controller's own verdict on the attempt, in one line: "state result counters".
+#
+# Read from the controller because it is the only node that knows the attempt ended: an agent
+# that was never reached logs nothing at all, and the harness cannot tell "still working" from
+# "gave up 3 minutes ago" by pinging it. Safe to call while the ctrl NIC is the live one, which
+# is the whole of wait_online.
+ctrl_verdict() {
+	dsh "$CTRL_IP" 'printf "%s %s %s\n" "$(sysevent get onboarding::state)" \
+	                                    "$(sysevent get onboarding::result)" \
+	                                    "$(sysevent get onboarding::counters | tr " " "/")"'
+}
+
 wait_online() {
-	local dir="$1" waited=0 up="" next_report="$POLL_REPORT"
+	local dir="$1" waited=0 up="" next_report="$POLL_REPORT" verdict
 	while [ "$waited" -lt "$DEADLINE" ]; do
 		sleep "$POLL"
 		waited=$((waited + POLL))
@@ -217,11 +229,26 @@ wait_online() {
 			return 0
 		fi
 		if [ "$waited" -ge "$next_report" ]; then
-			say "  ...${waited}s, agent not online yet"
+			verdict="$(ctrl_verdict)"
+			say "  ...${waited}s, agent not online yet (controller: ${verdict:-unreadable})"
 			next_report=$((next_report + POLL_REPORT))
+			# Fail fast on the controller's own verdict. 26082220 r8 burned the whole
+			# 300 s DEADLINE on a round the controller had already given up on at 36 s
+			# ("0 succeeded, 1 failed", the GATT connect never landed) -- 4 minutes of
+			# polling a node that was never going to answer, and, worse, 4 more minutes
+			# of syslog ring churn before the harvest, which is why that round's evidence
+			# had to be dug out of messages.1.gz. Only `failed` aborts: `done` with a
+			# success result happens well before the agent has a route, so treating
+			# state=done as terminal would abort every good round.
+			case "$verdict" in
+				done*failed*)
+					say "controller gave up after ${waited}s: ${verdict} -- aborting the round early"
+					return 1
+					;;
+			esac
 		fi
 	done
-	say "DEADLINE ${DEADLINE}s reached without the agent coming online"
+	say "DEADLINE ${DEADLINE}s reached without the agent coming online (controller: $(ctrl_verdict))"
 	return 1
 }
 
