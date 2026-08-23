@@ -14,6 +14,7 @@ A collection of utility scripts and tools for network device management, monitor
   - [CVE-2026 dnsmasq Vulnerability Tester](#cve-2026-dnsmasq-vulnerability-tester)
   - [Network Stability Checker](#network-stability-checker)
   - [Web GUI Factory-Reset Test (Issue #451)](#web-gui-factory-reset-test-issue-451)
+  - [Mesh Onboarding Timing Test](#mesh-onboarding-timing-test)
 - [Installation](#installation)
 - [Requirements](#requirements)
 - [Contributing](#contributing)
@@ -46,6 +47,7 @@ Each tool is documented with its purpose, usage instructions, and technical deta
 | [CVE-2026 dnsmasq Tester](#cve-2026-dnsmasq-vulnerability-tester) | [`dnsmasq_cve_2026/dnsmasq_cve_tester.py`](dnsmasq_cve_2026/dnsmasq_cve_tester.py) | Network + static analysis test suite for 6 dnsmasq CVEs (May 2026) |
 | [Network Stability Checker](#network-stability-checker) | [`scripts/net_stability.py`](scripts/net_stability.py) | Continuous ISP outage monitor — collects Cox SLA violation evidence |
 | [Web GUI Factory-Reset Test](#web-gui-factory-reset-test-issue-451) | [`web_gui_factory_reset_test/`](web_gui_factory_reset_test/) | Reproduce/diagnose #451 — web GUI refused after repeated factory resets |
+| [Mesh Onboarding Timing Test](#mesh-onboarding-timing-test) | [`mesh_onboard_timing_test/`](mesh_onboard_timing_test/) | Measure BLE-onboard → agent-online time on a two-node mesh, with a per-milestone breakdown |
 
 ---
 
@@ -1002,6 +1004,98 @@ Exit code `1` = bug reproduced (or DUT unreachable); `0` = all N resets recovere
 
 - `sshpass`, `curl`, `ping` on the host
 - SSH + JNAP access to the DUT
+
+---
+
+### Mesh Onboarding Timing Test
+
+**Directory:** [`mesh_onboard_timing_test/`](mesh_onboard_timing_test/)
+**Script:** [`onboard-timing-test.sh`](mesh_onboard_timing_test/onboard-timing-test.sh)
+
+Measures, repeatably, how long a Pinnacle 2.0 (OpenWrt ED6) agent takes to go from *BLE onboard
+command received* to *can actually reach the controller and the internet* — and where that time
+goes. The number is comparable between firmware builds, which is the point.
+
+#### Topology
+
+Two USB ethernet NICs on the test host, one cabled to each node. **NIC A** (`192.168.1.254`) goes
+to a LAN port on the controller; **NIC B** (`192.168.1.9`) goes to a LAN port on the agent. The
+controller holds the WAN uplink, so the agent reaches the internet only over the mesh backhaul —
+which is exactly what is being measured.
+
+#### The `192.168.1.1` collision
+
+An **unconfigured** agent serves `192.168.1.1`, and so does the controller. With both NICs up on
+the same `/24`, that address resolves to whichever node wins the ARP race. A factory reset issued
+against the wrong one costs you the controller. Two mitigations, both mandatory and both built in:
+
+1. **One NIC at a time** — `nic ctrl` / `nic agent` toggle the NetworkManager profiles.
+2. **MAC-guard every destructive call** — `uci -q get devinfo.info.hw_mac_addr` is the identity,
+   and `flash` / `reset` refuse to act unless the box that answers is the one you named.
+
+Note also that once the agent is onboarded, the controller LAN is reachable *through* it — so with
+only the agent NIC up, `192.168.1.1` answers as the controller. That is the mesh working, but it
+means the collision is live in both directions.
+
+#### Usage
+
+```bash
+cd mesh_onboard_timing_test
+
+./onboard-timing-test.sh nic ctrl                      # switch which node the host can reach
+./onboard-timing-test.sh identify 192.168.1.1          # MAC-guarded identity + build
+./onboard-timing-test.sh flash <img> 192.168.1.111 74:12:13:21:55:e6
+./onboard-timing-test.sh reset 192.168.1.111 74:12:13:21:55:e6
+./onboard-timing-test.sh trigger                       # onboarding::pair=start on the controller
+./onboard-timing-test.sh measure -o /tmp/round-1       # harvest + timeline for a finished round
+./onboard-timing-test.sh round   -o /tmp/round-1       # reset -> trigger -> wait -> measure
+./onboard-timing-test.sh run -n 5 -o /tmp/soak         # N rounds back to back
+```
+
+Bench parameters are all env-overridable: `CTRL_NIC_CONN`, `AGENT_NIC_CONN`, `CTRL_MAC`,
+`AGENT_MAC`, `CTRL_IP`, `AGENT_DHCP_IP`, `DEADLINE`, `POLL`, `OUTROOT`, `BACKHAUL_SSID`.
+
+#### What "onboarded" means
+
+The bar is the one a user would apply, checked **from the agent** — a host-side ping proves only
+that the host's NIC works, and the controller's `onboarding::state=done` fires while the agent is
+still bringing its fronthaul BSSes up:
+
+```
+ping 192.168.1.1   # the controller, i.e. the backhaul carries traffic
+ping 8.8.8.8       # the internet, i.e. the controller is routing for it
+```
+
+#### Reading the clock
+
+Use the `[t=NNN.NN]` uptime markers, **never wall-clock timestamps**: the DUT boots with an
+unsynced clock (dates months in the past) and jumps forward mid-onboard when NTP lands, so a
+wall-clock sort interleaves before-jump and after-jump lines into nonsense.
+
+Three log sources are harvested, because no single one survives a round: `logread` (the live ring —
+syslog-ng reloads after NTP sync and *restarts* it, so the middle of a round vanishes later),
+`/tmp/log/messages.1.gz` (what `logread` just discarded), and `/tmp/wifi-monitor.log` (wifi-monitor's
+own ring, unaffected by syslog rotation).
+
+#### Reference numbers
+
+| build | GATT → agent online | notes |
+|---|---|---|
+| 26082215 | 136.9 s | `sta_iface` latch repair cost 41 s; a stale-hostapd reading then armed a back-out repair costing a further 59 s and three backhaul drops |
+| 26082216 | 62.8 s / 64.1 s | latch repair down to ~10 s; back-out repair never fires |
+
+#### Secrets
+
+Harvested logs contain plaintext credentials — `beerocks_agent.*.log` prints fronthaul and bSTA
+PSKs, and `/var/run/hostapd-*.conf` carries `wpa_passphrase`. Export `BACKHAUL_SSID` and it is
+replaced with `<backhaul-ssid>` everywhere; `key=` / `passphrase=` / `psk=` / `password=` values are
+redacted unconditionally. **Do not publish the artefact directories** — redaction is best-effort.
+
+#### Requirements
+
+- `nmcli` (NetworkManager), `ssh`, `scp`, `md5sum` on the host
+- Two USB ethernet NICs, one cabled to each node
+- SSH access to both nodes (root, blank password on engineering builds)
 
 ---
 
