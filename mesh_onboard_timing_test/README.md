@@ -104,7 +104,9 @@ Everything is env-overridable for a different bench:
 | `CTRL_IP` | `192.168.1.1` | controller LAN address |
 | `AGENT_DHCP_IP` | `192.168.1.111` | where the onboarded agent lands |
 | `DEADLINE` | `300` | seconds to wait for a round to converge |
-| `POLL` | `10` | seconds between convergence probes |
+| `POLL` | `2` | seconds between convergence probes — this is the only error term in the headline number |
+| `POLL_REPORT` | `10` | seconds between progress lines, so a fine `POLL` is not a wall of output |
+| `SETTLE_WATCH` | `60` | seconds to keep watching after the agent is reachable, before harvesting |
 | `OUTROOT` | `~/code/claude/onboard-tests` | where artefacts go |
 | `BACKHAUL_SSID` | unset | if set, redacted out of every harvested file |
 
@@ -120,6 +122,19 @@ ping 8.8.8.8       # the internet, i.e. the controller is routing for it
 A host-side ping proves only that the host's own NIC works. The controller's own
 `onboarding::state=done` is also not the bar: it goes `done` while the agent is still bringing
 its fronthaul BSSes up.
+
+**The probe reads the agent's own `/proc/uptime` in the same ssh session, right after the pings
+answer.** That is what makes the headline comparable with the `[t=NNN.NN]` markers in the log. A
+host wall-clock stamp would have to be mapped onto the agent's clock afterwards — and the agent's
+clock jumps forward when NTP lands mid-onboard, so that mapping is guesswork on exactly the rounds
+that matter. The number is an upper bound by one `POLL` interval plus the ping time, nothing more.
+
+**Reachable is the headline, not the end of the round.** The M2 credentials reach the radio that
+carries the bSTA *after* the agent is pingable, and that is where the HT40 legalisation, the
+back-out trigger and the post-credential backhaul dip live. So the harness waits `SETTLE_WATCH`
+seconds before harvesting. Harvesting on the online edge cut one 26082217 artefact off at `t=211`
+and lost a bSTA drop at `t=237`: the saved logs said the round ended clean, and the live log read
+minutes later said it had not.
 
 ## Reading the clock — three log sources, and why
 
@@ -154,7 +169,21 @@ Two more busybox traps the script works around:
 | `replacement beerocks_agent up ... after Ns` | the respawn completed |
 | `legalised HT40 ...` | an illegal HT40 pair was corrected before hostapd refused the interface |
 | `back-out trigger now holds` | the runtime SSID looked wrong; a repair is pending unless it self-clears |
+| `bhsta1 is ... inside the Ns activation grace` | the bSTA went down; wifi-monitor is watching, not acting |
 | `backhaul: recovered (was disconnected ~Ns)` | the last backhaul settle — usually the end of the round |
+
+### Do not trust the settle line on its own
+
+`GATT -> last logged backhaul settle` is a *secondary* number and the harness prints a `WARNING`
+next to it when it is not trustworthy. wifi-monitor deliberately emits no
+`recovered (was disconnected ~Ns)` for a dip that falls inside its 30 s activation grace, because a
+reassociate that soon after WPS is measured harmful. On builds where that gap is open, the settle
+therefore reads *earlier* than a drop the same log reports a line later. The harness now detects
+"an activation-grace dip after the settle" and says so rather than quoting a number that is not one.
+
+Note the converse, which is easy to misread the other way: an activation-grace line **before** the
+`WPS-PBC completed` row is just the bSTA scanning before it ever associated. That is not a dip and
+gets no warning.
 
 ## Secrets
 
@@ -180,6 +209,7 @@ Two-node bench, 5 GHz backhaul on channel 161, agent factory reset before each r
 |---|---|---|
 | 26082215 | 136.9 s | `sta_iface` latch repair cost 41 s; a stale-hostapd reading then armed a back-out repair that cost a further 59 s and three backhaul drops |
 | 26082216 | 62.8 s / 64.1 s | latch repair down to ~10 s; back-out repair never fires |
+| 26082217 | ≤44 s / ≤35 s | measured with `POLL=10`, hence the `≤`; this is what `POLL=2` and the agent-clocked probe exist to sharpen |
 
 Where the 62–64 s goes on 26082216:
 

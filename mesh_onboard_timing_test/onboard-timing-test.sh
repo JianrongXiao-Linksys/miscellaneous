@@ -37,7 +37,16 @@ AGENT_MAC="${AGENT_MAC:-74:12:13:21:55:e6}"
 CTRL_IP="${CTRL_IP:-192.168.1.1}"
 AGENT_DHCP_IP="${AGENT_DHCP_IP:-192.168.1.111}"
 DEADLINE="${DEADLINE:-300}"
-POLL="${POLL:-10}"
+# Convergence poll interval. This is the ONLY error term in the headline number, so it is small:
+# at POLL=10 the reported time carried a "<=" of up to 10 s and rounds could not be compared to
+# better than that, which is the same order as the differences between firmware builds we are
+# trying to see. Each probe is one ssh with two -c1 -W1 pings, so 2 s is affordable.
+POLL="${POLL:-2}"
+# Progress lines every this many seconds, so a fine POLL does not produce a wall of output.
+POLL_REPORT="${POLL_REPORT:-10}"
+# Seconds to keep watching AFTER the agent is reachable, before harvesting. The post-credential
+# radio churn happens here; harvesting on the online edge silently truncates the evidence.
+SETTLE_WATCH="${SETTLE_WATCH:-60}"
 OUTROOT="${OUTROOT:-$HOME/code/claude/onboard-tests}"
 
 # Blank root password on the DUT, and the host key changes on every reflash, so pinning it
@@ -177,24 +186,40 @@ trigger() {
 # AGENT, both the controller and the internet answer. Checked from the agent because a host-side
 # ping proves only that the host's own NIC works.
 
+#
+# On success it prints the AGENT's own uptime, read in the same ssh session immediately after the
+# pings answered. That is what makes the result comparable with the `[t=NNN.NN]` log markers: a
+# host wall-clock stamp has to be mapped onto the agent's clock afterwards, and the agent's clock
+# jumps when NTP lands mid-onboard, so the mapping is guesswork on precisely the rounds that
+# matter. It is an upper bound by one poll interval plus the ping time, and nothing more.
 agent_online() {
 	local out
-	out="$(dsh "$AGENT_DHCP_IP" 'ping -c2 -W2 '"$CTRL_IP"' >/dev/null 2>&1 && echo ctrl=ok || echo ctrl=fail
-	                             ping -c2 -W2 8.8.8.8 >/dev/null 2>&1 && echo inet=ok || echo inet=fail')"
-	case "$out" in *ctrl=ok*inet=ok*) return 0 ;; esac
+	out="$(dsh "$AGENT_DHCP_IP" 'ping -c1 -W1 '"$CTRL_IP"' >/dev/null 2>&1 && echo ctrl=ok || echo ctrl=fail
+	                             ping -c1 -W1 8.8.8.8 >/dev/null 2>&1 && echo inet=ok || echo inet=fail
+	                             cut -d" " -f1 /proc/uptime')"
+	case "$out" in
+		*ctrl=ok*inet=ok*) printf '%s\n' "$out" | tail -1; return 0 ;;
+	esac
 	return 1
 }
 
 wait_online() {
-	local waited=0
+	local dir="$1" waited=0 up="" next_report="$POLL_REPORT"
 	while [ "$waited" -lt "$DEADLINE" ]; do
 		sleep "$POLL"
 		waited=$((waited + POLL))
-		if agent_online; then
-			say "agent online after ${waited}s of waiting (host clock $(date '+%H:%M:%S'))"
+		if up="$(agent_online)"; then
+			say "agent online after ${waited}s of waiting (host clock $(date '+%H:%M:%S'), agent uptime ${up})"
+			# Handed to timeline() through the artefact dir rather than a variable: the
+			# measurement belongs with the logs it is quoted next to, and a re-run of
+			# `measure -o <dir>` must reproduce the same number months later.
+			[ -n "$dir" ] && { mkdir -p "$dir"; printf '%s\n' "$up" > "$dir/online-uptime"; }
 			return 0
 		fi
-		say "  ...${waited}s, agent not online yet"
+		if [ "$waited" -ge "$next_report" ]; then
+			say "  ...${waited}s, agent not online yet"
+			next_report=$((next_report + POLL_REPORT))
+		fi
 	done
 	say "DEADLINE ${DEADLINE}s reached without the agent coming online"
 	return 1
@@ -260,7 +285,7 @@ timeline() {
 	printf '%10s  %8s  %s\n' "t(s)" "delta" "event"
 	# One awk pass so the rows come out in t order regardless of which file they came from.
 	grep -hoE '\[t=[0-9.]+\].*' $logs 2>/dev/null \
-	  | grep -E 'GATT command received|starting WPS-PBC|triggering WPS-PBC|WPS-PBC completed|fronthaul credentials persisted|replacement beerocks_agent|back-out|recovered \(was disconnected|reassociating now|legalised HT40|rebuilding|hostapd still reports' \
+	  | grep -E 'GATT command received|starting WPS-PBC|triggering WPS-PBC|WPS-PBC completed|fronthaul credentials persisted|replacement beerocks_agent|back-out|recovered \(was disconnected|reassociating now|legalised HT40|rebuilding|hostapd still reports|activation grace|backhaul: connected on boot' \
 	  | sed -n 's/^\[t=\([0-9.]*\)\] *\(.*\)$/\1|\2/p' \
 	  | sort -t'|' -k1,1g -u \
 	  | awk -F'|' -v t0="$t0" '$1+0 >= t0+0 { printf "%10.2f  %+8.2f  %s\n", $1, $1-t0, $2 }'
@@ -270,11 +295,34 @@ timeline() {
 	grep -hoE "sta-iface-repair: .*after [0-9]+s -> killing beerocks_agent.*" $logs 2>/dev/null | head -1
 	grep -hoE "sta-iface-repair: replacement beerocks_agent up .*" $logs 2>/dev/null | head -1
 
-	local last
+	# THE HEADLINE. Agent-clocked, so it sits on the same axis as every row above.
+	local online
+	online="$(cat "$dir/online-uptime" 2>/dev/null)"
+	if [ -n "$online" ]; then
+		awk -v a="$t0" -v b="$online" -v p="$POLL" \
+			'BEGIN { printf "[onboard] GATT -> agent online (pings controller AND internet): %.2f - %.2f = %.2f s (+/-%ds, one poll)\n", b, a, b-a, p }'
+	else
+		say "no online-uptime recorded for this round -- run 'round', not 'measure', for the headline number"
+	fi
+
+	# Secondary, and reported with its caveat. The settle line is only as good as the last
+	# backhaul event in the log, and wifi-monitor deliberately does NOT emit a
+	# `recovered (was disconnected ~Ns)` for a dip that falls inside its 30 s activation grace
+	# (a reassociate that soon after WPS is measured harmful). On builds before that gap was
+	# closed the settle therefore reads EARLIER than a drop the same log reports one line later
+	# -- 26082217 r4 printed 29.72 s with the bSTA going SCANNING at +24.63 s. So check for a
+	# grace dip after the settle and say so instead of quoting a number that is not one.
+	local last dip
 	last="$(grep -hoE '\[t=[0-9.]+\] backhaul: (recovered|connected)' $logs 2>/dev/null \
 	        | tail -1 | sed -n 's/^\[t=\([0-9.]*\)\].*/\1/p')"
+	dip="$(grep -hoE '\[t=[0-9.]+\][^|]*inside the [0-9]+s activation grace' $logs 2>/dev/null \
+	       | tail -1 | sed -n 's/^\[t=\([0-9.]*\)\].*/\1/p')"
 	[ -n "$last" ] && awk -v a="$t0" -v b="$last" \
-		'BEGIN { printf "[onboard] GATT -> last backhaul settle: %.2f - %.2f = %.2f s\n", b, a, b-a }'
+		'BEGIN { printf "[onboard] GATT -> last logged backhaul settle: %.2f - %.2f = %.2f s\n", b, a, b-a }'
+	# BEGIN, not a pattern-action rule: awk is given no input here, so a bare `d>b { ... }` never
+	# runs its body and the warning silently never fires -- which is how it failed its own test.
+	[ -n "$last" ] && [ -n "$dip" ] && awk -v b="$last" -v d="$dip" \
+		'BEGIN { if (d+0 > b+0) printf "[onboard] WARNING: bSTA went down at t=%.2f, AFTER that settle, inside the activation grace -- the settle above is not the end of the churn on this build\n", d }'
 }
 
 # --- a whole round ---------------------------------------------------------------------
@@ -299,7 +347,17 @@ one_round() {
 	sleep 150
 
 	trigger  || return 1
-	wait_online || { harvest "$dir"; return 1; }
+	wait_online "$dir" || { harvest "$dir"; return 1; }
+
+	# Do NOT harvest at the instant the agent answers. "Reachable" is the headline, not the end of
+	# the round: the M2 credentials reach the radio carrying the bSTA afterwards, and that is where
+	# the HT40 legalisation, the back-out trigger and the post-M2 backhaul dip live. Harvesting on
+	# the online edge cut the 26082217 r5 artefact off at t=211 and lost a bSTA drop at t=237 --
+	# the artefact said the round ended clean when the log, read live minutes later, said it had not.
+	# The headline is already banked in $dir/online-uptime, so this window costs nothing but wall time.
+	say "settling for ${SETTLE_WATCH}s before harvesting, so the post-credential churn is in the logs"
+	sleep "$SETTLE_WATCH"
+
 	harvest "$dir"
 	timeline "$dir" | tee "$dir/TIMELINE.txt"
 }
