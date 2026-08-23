@@ -156,6 +156,18 @@ it is not at `192.168.1.111`; it is unconfigured at `192.168.1.1` behind `AGENT_
 harvest falls back there, MAC-guarded, and says so. Without that fallback, r9's artefact dir was
 four files with three of them empty — and the failed rounds are exactly the ones whose logs matter.
 The controller side (including its `messages.1.gz`) is pulled first, while its NIC is still up.
+The agent is looked for in four places, in order: its DHCP address on the current NIC, the same
+address on the agent NIC (direct cable, so it works with the backhaul down), `192.168.1.1`
+MAC-guarded, and finally its IPv6 link-local derived from `AGENT_MAC`. The last one is not
+belt-and-braces: on r10 the agent had reverted to a static `192.168.1.1` while the controller was
+*also* reachable at `192.168.1.1` through the agent's own bridge, so no v4 address on the bench
+meant "the agent". A link-local is per-interface — whatever answers it on this cable is the box on
+the other end of this cable.
+
+**The daemon's own log mirror is harvested first.** `ble-onboard` writes every line it logs to
+`/tmp/ble-onboard.log` (64 KB, one generation kept) precisely because the 128 KB syslog ring drops
+an onboarding within minutes. On r10 `logread` had already lost the whole sequence and that file
+still had it complete, so it is now the first source both for the harvest and for the timeline.
 
 ## Reading the clock — three log sources, and why
 
@@ -231,6 +243,8 @@ Two-node bench, 5 GHz backhaul on channel 161, agent factory reset before each r
 | 26082215 | 136.9 s | `sta_iface` latch repair cost 41 s; a stale-hostapd reading then armed a back-out repair that cost a further 59 s and three backhaul drops |
 | 26082216 | 62.8 s / 64.1 s | latch repair down to ~10 s; back-out repair never fires |
 | 26082217 | ≤44 s / ≤35 s | measured with `POLL=10`, hence the `≤`; this is what `POLL=2` and the agent-clocked probe exist to sharpen |
+| 26082220 | 38.1 s / 32.6 s | first `POLL=2` numbers, so the first ones comparable to ±2 s |
+| 26082223 | 20.8 s | the backhaul STA is now armed at boot instead of after the pair press, so the WPS trigger falls at +4.7 s instead of +20.1 s |
 
 Where the 62–64 s goes on 26082216:
 

@@ -287,10 +287,33 @@ wait_online() {
 # The MAC guard is not optional here: on the agent NIC, 192.168.1.1 is whichever node answers,
 # and harvesting the controller into agent-*.txt would be worse than harvesting nothing.
 agent_harvest_ip() {
+	local ll
 	[ -n "$(mac_of "$AGENT_DHCP_IP")" ] && { printf '%s' "$AGENT_DHCP_IP"; return 0; }
 	nic agent >/dev/null
+	# Directly cabled now, so this works even when the backhaul is down and the lease is not
+	# reachable through the controller.
+	[ -n "$(mac_of "$AGENT_DHCP_IP")" ] && { printf '%s' "$AGENT_DHCP_IP"; return 0; }
 	[ "$(mac_of "$CTRL_IP")" = "$AGENT_MAC" ] && { printf '%s' "$CTRL_IP"; return 0; }
+	# Last resort, and the only address on this bench that cannot be ambiguous: the agent's
+	# IPv6 link-local, derived from its label MAC. 26082223 r10 needed it -- the agent had
+	# reverted to a static 192.168.1.1 while the controller was ALSO reachable at 192.168.1.1
+	# through the agent's own bridge, so the MAC guard on that address correctly refused, and
+	# there was no v4 address left that meant "the agent". A link-local is per-interface, so
+	# whatever answers it on this cable is the box on the other end of this cable.
+	ll="$(agent_ll6)"
+	[ -n "$ll" ] && [ "$(mac_of "$ll")" = "$AGENT_MAC" ] && { printf '%s' "$ll"; return 0; }
 	return 1
+}
+
+# The agent's IPv6 link-local, scoped to the agent NIC: EUI-64 of AGENT_MAC with the U/L bit
+# flipped, which is what SLAAC builds and what the DUT actually carries.
+agent_ll6() {
+	local dev a1 a2 a3 a4 a5 a6
+	dev="$(nmcli -g GENERAL.DEVICES connection show "$AGENT_NIC_CONN" 2>/dev/null | head -1)"
+	[ -n "$dev" ] || return 1
+	IFS=: read -r a1 a2 a3 a4 a5 a6 <<< "$AGENT_MAC"
+	[ -n "$a6" ] || return 1
+	printf 'fe80::%02x%s:%sff:fe%s:%s%s%%%s' "$(( 0x$a1 ^ 0x02 ))" "$a2" "$a3" "$a4" "$a5" "$a6" "$dev"
 }
 
 harvest() {
@@ -309,6 +332,13 @@ harvest() {
 
 harvest_agent() {
 	local dir="$1"
+	# The daemon's OWN mirror first, because it is the only source that does not lose the round.
+	# ble-onboard writes every line it logs to /tmp/ble-onboard.log (64 KB, one generation kept)
+	# precisely because the 128 KB syslog ring drops the onboarding inside minutes. On 26082223
+	# r10 the syslog ring had already rotated the whole sequence away and this file still had it
+	# complete, from `daemon starting` to the timeout.
+	dsh "$AGENT_DHCP_IP" 'cat /tmp/ble-onboard.log.1 /tmp/ble-onboard.log 2>/dev/null' \
+		| redact > "$dir/agent-ble-onboard.log"
 	dsh "$AGENT_DHCP_IP" 'logread'                | redact > "$dir/agent-logread.txt"
 	dsh "$AGENT_DHCP_IP" 'cat /tmp/wifi-monitor.log' | redact > "$dir/wifi-monitor.log"
 	scp "${SSH_OPTS[@]}" -q "root@$AGENT_DHCP_IP:/tmp/log/messages.1.gz" "$dir/messages.1.gz" 2>/dev/null
@@ -335,7 +365,10 @@ harvest_agent() {
 # per round, and a timeline whose rows change between rounds cannot be diffed.
 timeline() {
 	local dir="$1" t0
-	local logs="$dir/agent-logread.txt $dir/wifi-monitor.log"
+	# agent-ble-onboard.log first: it is the daemon's own mirror and the one source that does
+	# not lose the round to ring rotation. The others still matter -- wifi-monitor's backhaul
+	# lines and the kernel/netifd context are not in it.
+	local logs="$dir/agent-ble-onboard.log $dir/agent-logread.txt $dir/wifi-monitor.log"
 	[ -f "$dir/messages.1.gz" ] && zcat "$dir/messages.1.gz" > "$dir/.messages.1" 2>/dev/null \
 		&& logs="$logs $dir/.messages.1"
 
