@@ -164,6 +164,17 @@ belt-and-braces: on r10 the agent had reverted to a static `192.168.1.1` while t
 meant "the agent". A link-local is per-interface — whatever answers it on this cable is the box on
 the other end of this cable.
 
+**Readiness is two facts, not one.** A round can fail with the bSTA netdev present the whole
+time: `wpa_supplicant`'s control socket for that netdev is owned by a different process, and
+`agent_lan_to_dhcp`'s netifd reload destroys the socket while leaving the netdev alone. 26082224 r11
+lost the round exactly there — the pre-armed fast path read "netdev up, nothing to apply", skipped
+the `wifi reload` that is the only thing which recreates the socket, and then spent 15 s waiting for
+a socket that was never coming. So when a timeline shows `no radio apply needed` immediately
+followed by `appeared in wpa_supplicant Ns after the netdev`, that is the failure, not a slow start.
+The converse is normal and expected: the socket goes unreadable *during* the WPS association
+(the supplicant is restarting), which is why success is read from `iw dev <if> link`, not from
+`wpa_cli status`.
+
 **The daemon's own log mirror is harvested first.** `ble-onboard` writes every line it logs to
 `/tmp/ble-onboard.log` (64 KB, one generation kept) precisely because the 128 KB syslog ring drops
 an onboarding within minutes. On r10 `logread` had already lost the whole sequence and that file
@@ -245,6 +256,7 @@ Two-node bench, 5 GHz backhaul on channel 161, agent factory reset before each r
 | 26082217 | ≤44 s / ≤35 s | measured with `POLL=10`, hence the `≤`; this is what `POLL=2` and the agent-clocked probe exist to sharpen |
 | 26082220 | 38.1 s / 32.6 s | first `POLL=2` numbers, so the first ones comparable to ±2 s |
 | 26082223 | 20.8 s | the backhaul STA is now armed at boot instead of after the pair press, so the WPS trigger falls at +4.7 s instead of +20.1 s |
+| 26082225 | 21.2 s | same shape, and the first round in which the node was still onboarded an hour later: WPS armed at +4.6 s, associated at +13.2 s, online at +21.2 s |
 
 Where the 62–64 s goes on 26082216:
 
