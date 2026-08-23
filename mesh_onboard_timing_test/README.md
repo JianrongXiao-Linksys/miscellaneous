@@ -112,12 +112,52 @@ Everything is env-overridable for a different bench:
 
 ## What "onboarded" means here
 
-The bar is the one a user would apply, checked **from the agent**, not from the host:
+Two bars, and a round has to clear both.
+
+**1. Reachability**, checked **from the agent**, not from the host:
 
 ```
 ping 192.168.1.1   # the controller, i.e. the backhaul carries traffic
 ping 8.8.8.8       # the internet, i.e. the controller is routing for it
 ```
+
+**2. Credential alignment** — every fronthaul and backhaul BSS on the agent carries the
+controller's credential:
+
+```bash
+./onboard-timing-test.sh creds            # standalone
+./onboard-timing-test.sh creds -o /tmp/x  # also writes x/creds.txt
+```
+```
+role  radio    controller ssid / pskfp     agent ssid / pskfp        verdict
+fh    phy00.0  Linksys00003 / f2af139e     Linksys2155E6 / 9d6e4d26  MISMATCH: ssid, psk
+fh    phy00.1  Linksys00003 / f2af139e     Linksys2155E6 / 9d6e4d26  MISMATCH: ssid, psk
+bh    phy00.1  <backhaul-ssid> / 5a84fa69  O3sNB...k0F / c6483c63    MISMATCH: ssid, psk
+```
+
+Bar 2 exists because 26082225 r12 cleared bar 1 in 21.15 s — the fastest round measured — and was
+running its own **factory** SSID on every BSS. `beerocks_backhaul` could not open
+`/var/run/wpa_supplicant/bhsta1` (89,643 identical `wpa_ctrl_open() failed` lines in an 11-second
+window), the prplMesh agent never left `WAIT_FOR_BACKHAUL_MANAGER_CONNECTED_NOTIFICATION (12)`, so
+no WSC M2 ever arrived and no credential was ever applied. The bSTA was associated, DHCP worked and
+the internet answered — but no client could roam to that node and no third node could onboard
+through it. Reachability alone cannot see this.
+
+How the check works, and why each part is the way it is:
+
+- **Records come from hostapd's runtime config** (`/var/run/hostapd-phy*.conf`), because that IS
+  the credential rather than a report about it. `iw dev` is read too and a config the radio never
+  took is flagged `not-on-air`.
+- **Roles come from hostapd's `multi_ap` field** — `1` = backhaul BSS, `2` = fronthaul, `3` = both.
+  Never from the SSID: on r12 both of the agent's SSIDs looked plausible and neither was right.
+- **Keyed on (role, radio), not on interface name.** The CAP runs an extra bBSS, so the indices do
+  not line up. Radio-index equality assumes identical hardware on both nodes; on a mixed bench
+  compare by band instead.
+- **The passphrase never leaves the DUT.** It is reduced there to the first 8 hex of its md5.
+  Enough to see "same" or "different", nothing more.
+- **`wpa` version and pairwise cipher fail the round; `wpa_key_mgmt` only prints a note.** A CAP
+  legitimately advertises more key_mgmt suites than an agent (`WPA-PSK-SHA256` for 11w), so a
+  difference there is worth seeing and not worth failing on.
 
 A host-side ping proves only that the host's own NIC works. The controller's own
 `onboarding::state=done` is also not the bar: it goes `done` while the agent is still bringing
@@ -256,7 +296,7 @@ Two-node bench, 5 GHz backhaul on channel 161, agent factory reset before each r
 | 26082217 | ≤44 s / ≤35 s | measured with `POLL=10`, hence the `≤`; this is what `POLL=2` and the agent-clocked probe exist to sharpen |
 | 26082220 | 38.1 s / 32.6 s | first `POLL=2` numbers, so the first ones comparable to ±2 s |
 | 26082223 | 20.8 s | the backhaul STA is now armed at boot instead of after the pair press, so the WPS trigger falls at +4.7 s instead of +20.1 s |
-| 26082225 | 21.2 s | same shape, and the first round in which the node was still onboarded an hour later: WPS armed at +4.6 s, associated at +13.2 s, online at +21.2 s |
+| 26082225 | 21.2 s **but not onboarded** | reachability in 21.2 s with the agent still on its factory SSIDs — see "Credential alignment" above. This is the round that added bar 2 |
 
 Where the 62–64 s goes on 26082216:
 

@@ -425,6 +425,138 @@ timeline() {
 
 # --- a whole round ---------------------------------------------------------------------
 
+# --- credential alignment -------------------------------------------------------------
+#
+# "Online" is not "onboarded". 26082225 r12 pinged the controller and the internet in 21 s and
+# was still running its own factory SSIDs on every BSS: the prplMesh agent was stuck in
+# WAIT_FOR_BACKHAUL_MANAGER_CONNECTED_NOTIFICATION (12), so no WSC M2 ever arrived and no
+# credential was ever applied. A client could not roam to it and a third node could not onboard
+# through it. The round looked like the best result we had measured.
+#
+# So the round now also asserts that every fronthaul and backhaul BSS on the agent carries the
+# controller's credential.
+
+# Every BSS a node runs, one record per BSS, read from hostapd's own runtime config -- which IS
+# the credential rather than a report about it. Also reports the live driver SSID, so a hostapd
+# config that never reached the radio is visible as a split brain rather than as a pass.
+#
+# hostapd's multi_ap field is what tells a backhaul BSS from a fronthaul one: 1=bBSS, 2=fBSS,
+# 3=both. Not the SSID -- on r12 both of the agent's SSIDs looked plausible and neither was the
+# controller's.
+#
+# The passphrase never leaves the DUT. It is reduced there to the first 8 hex of its md5, which
+# is enough to see "same" or "different" and nothing more.
+#
+# Shipped as base64 rather than as a quoted ssh argument: the awk program needs single quotes
+# and $0, and every nesting of those through ssh has been a source of silent breakage.
+CREDS_REMOTE=$(cat <<'REMOTE'
+for f in /var/run/hostapd-phy*.conf; do
+    [ -f "$f" ] || continue
+    r=${f#/var/run/hostapd-}; r=${r%.conf}
+    awk -v radio="$r" '
+        function role() {
+            if (map == "1") return "bh"
+            if (map == "2") return "fh"
+            if (map == "3") return "fh+bh"
+            return "plain"
+        }
+        function flush() {
+            if (ifn != "") printf "%s|%s|%s|%s|wpa%s/%s/%s|%s\n", radio, role(), ifn, ssid, wpa, pw, km, pass
+            ifn=""; ssid=""; map=""; wpa=""; pw=""; km=""; pass=""
+        }
+        /^interface=/ || /^bss=/ { flush(); ifn=substr($0, index($0,"=")+1) }
+        /^ssid=/                 { ssid=substr($0, index($0,"=")+1) }
+        /^multi_ap=/             { map=substr($0, index($0,"=")+1) }
+        /^wpa=/                  { wpa=substr($0, index($0,"=")+1) }
+        /^wpa_pairwise=/ || /^rsn_pairwise=/ { pw=substr($0, index($0,"=")+1) }
+        /^wpa_key_mgmt=/         { km=substr($0, index($0,"=")+1) }
+        /^wpa_passphrase=/       { pass=substr($0, index($0,"=")+1) }
+        END { flush() }
+    ' "$f"
+done | while IFS="|" read -r radio role ifn ssid sec pass; do
+    fp=none
+    [ -n "$pass" ] && fp=$(printf %s "$pass" | md5sum | cut -c1-8)
+    live=$(iw dev "$ifn" info 2>/dev/null | sed -n "s/^[[:space:]]*ssid //p")
+    [ -n "$live" ] || live="(down)"
+    printf "%s|%s|%s|%s|%s|%s|%s\n" "$radio" "$role" "$ifn" "$ssid" "$sec" "$fp" "$live"
+done
+REMOTE
+)
+
+creds_dump() {
+	local b64
+	b64="$(printf '%s\n' "$CREDS_REMOTE" | base64 -w0)"
+	dsh "$1" "echo ${b64} | base64 -d | sh"
+}
+
+# Compare the agent's BSSes against the controller's, keyed on (role, radio) rather than on
+# interface name: the CAP runs an extra bBSS and the indices need not line up, but role plus
+# radio is the same question a client asks.
+#
+# Radio index equality assumes identical hardware on both nodes, which is this bench. On mixed
+# hardware compare by band instead.
+creds_check() {
+	local dir="${1:-}" cf af aip rc=0 line
+	local radio role ifn ssid sec fp live
+	local aline assid asec afp alive problems notes verdict
+
+	nic ctrl >/dev/null
+	cf="$(creds_dump "$CTRL_IP")"
+	[ -n "$cf" ] || { say "credential check: the controller returned no BSS records -- skipping"; return 1; }
+	if ! aip="$(agent_harvest_ip)"; then
+		say "credential check: the agent is unreachable -- cannot compare"
+		return 1
+	fi
+	af="$(creds_dump "$aip")"
+	[ -n "$af" ] || { say "credential check: the agent returned no BSS records"; return 1; }
+
+	{
+		printf 'role  radio    controller ssid / pskfp            agent ssid / pskfp                verdict\n'
+		printf '%s\n' "$cf" | while IFS='|' read -r radio role ifn ssid sec fp live; do
+			case "$role" in fh|bh|fh+bh) ;; *) continue ;; esac
+			aline="$(printf '%s\n' "$af" | awk -F'|' -v r="$radio" -v ro="$role" '$1==r && $2==ro {print; exit}')"
+			if [ -z "$aline" ]; then
+				printf '%-5s %-8s %-34s %-34s %s\n' "$role" "$radio" "${ssid} / ${fp}" "-" "MISSING on the agent"
+				continue
+			fi
+			IFS='|' read -r _ _ _ assid asec afp alive <<< "$aline"
+			problems=""; notes=""
+			[ "$ssid" = "$assid" ] || problems="${problems}${problems:+, }ssid"
+			[ "$fp"   = "$afp"   ] || problems="${problems}${problems:+, }psk"
+			# wpa version and pairwise cipher are the credential; key_mgmt is a set the AP
+			# offers and the CAP legitimately advertises more of it (WPA-PSK-SHA256 for 11w),
+			# so a difference there is worth printing and not worth failing a round over.
+			[ "${sec%%/*}" = "${asec%%/*}" ] || problems="${problems}${problems:+, }wpa-version"
+			[ "$(printf %s "$sec" | cut -d/ -f2)" = "$(printf %s "$asec" | cut -d/ -f2)" ] \
+				|| problems="${problems}${problems:+, }pairwise"
+			[ "${sec#*/*/}" = "${asec#*/*/}" ] || notes="key_mgmt CAP=${sec#*/*/} agent=${asec#*/*/}"
+			# A credential hostapd holds but the radio never took is not a credential.
+			[ "$alive" = "$assid" ] || problems="${problems}${problems:+, }not-on-air(driver=${alive})"
+			if [ -n "$problems" ]; then
+				verdict="MISMATCH: ${problems}"
+			else
+				verdict="aligned"
+			fi
+			printf '%-5s %-8s %-34s %-34s %s\n' "$role" "$radio" "${ssid} / ${fp}" "${assid} / ${afp}" \
+				"${verdict}${notes:+  [${notes}]}"
+		done
+	} > /tmp/.creds-report.$$
+
+	cat /tmp/.creds-report.$$
+	grep -qE 'MISMATCH|MISSING' /tmp/.creds-report.$$ && rc=1
+	if [ -n "$dir" ]; then
+		mkdir -p "$dir"
+		redact < /tmp/.creds-report.$$ > "$dir/creds.txt"
+	fi
+	rm -f /tmp/.creds-report.$$
+	if [ "$rc" = "0" ]; then
+		say "credential check: PASS -- every fronthaul and backhaul BSS matches the controller"
+	else
+		say "credential check: FAIL -- the agent is not carrying the controller's credentials"
+	fi
+	return "$rc"
+}
+
 one_round() {
 	local dir="$1"
 	nic ctrl >/dev/null
@@ -458,6 +590,10 @@ one_round() {
 
 	harvest "$dir"
 	timeline "$dir" | tee "$dir/TIMELINE.txt"
+
+	# Last, and it decides the round. Reaching the internet proves the bSTA associated; it says
+	# nothing about whether the agent was ever configured as a mesh AP.
+	creds_check "$dir"
 }
 
 # --- entry point -----------------------------------------------------------------------
@@ -469,6 +605,11 @@ case "$cmd" in
 	flash)    flash "${1:?image}" "${2:?ip}" "${3:-}" ;;
 	reset)    reset_node "${1:?ip}" "${2:-}" ;;
 	trigger)  trigger ;;
+	creds)
+		dir=""
+		[ "${1:-}" = "-o" ] && dir="$2"
+		creds_check "$dir"
+		;;
 	measure)
 		dir="${OUTROOT}/manual-$(date +%y%m%d%H%M)"
 		[ "${1:-}" = "-o" ] && dir="$2"
