@@ -47,6 +47,13 @@ POLL_REPORT="${POLL_REPORT:-10}"
 # Seconds to keep watching AFTER the agent is reachable, before harvesting. The post-credential
 # radio churn happens here; harvesting on the online edge silently truncates the evidence.
 SETTLE_WATCH="${SETTLE_WATCH:-60}"
+# How long, after the settle window, to keep re-checking the credentials before failing the round.
+# 180 s because the recovery path that delivers them can involve a beerocks_agent restart plus a
+# fresh registration walk: on 26082314 r17 that landed ~70 s after the settle window closed.
+CREDS_DEADLINE="${CREDS_DEADLINE:-180}"
+# Each credential probe is two ssh round trips and a NIC switch, so it is not free.
+CREDS_POLL="${CREDS_POLL:-15}"
+CREDS_POLL_REPORT="${CREDS_POLL_REPORT:-30}"
 OUTROOT="${OUTROOT:-$HOME/code/claude/onboard-tests}"
 
 # Blank root password on the DUT, and the host key changes on every reflash, so pinning it
@@ -557,6 +564,47 @@ creds_check() {
 	return "$rc"
 }
 
+# Poll creds_check until every BSS carries the controller's credentials, and report the agent
+# uptime at which that became true. This, not reachability, is when onboarding is finished.
+#
+# It is a poll and not a single shot because the credentials do not always arrive on the first
+# pass of the agent's registration. 26082314 r17: reachable at agent uptime 216.4, registration
+# stalled in WAIT_FOR_BACKHAUL_MANAGER_REGISTER_RESPONSE (7), lsmesh-sta-iface-repair killed
+# beerocks_agent (attempt 1/2), and the CAP's SSIDs landed on all three BSSes after the 60 s
+# settle window had already closed -- so the round was recorded FAIL and was, minutes later,
+# a PASS. A single shot measures when we happened to look; this measures the event.
+creds_wait() {
+	local dir="${1:-}" deadline="${2:-$CREDS_DEADLINE}" waited=0 up
+	while : ; do
+		if creds_check "$dir" > "${dir:-/tmp}/.creds-last" 2>&1; then
+			cat "${dir:-/tmp}/.creds-last"
+			up="$(agent_uptime)"
+			say "credentials aligned at agent uptime ${up:-unknown} (${waited}s into the credential wait)"
+			[ -n "$dir" ] && printf '%s\n' "${up:-unknown}" > "$dir/creds-uptime"
+			rm -f "${dir:-/tmp}/.creds-last"
+			return 0
+		fi
+		if [ "$waited" -ge "$deadline" ]; then
+			cat "${dir:-/tmp}/.creds-last"
+			say "credentials still not aligned ${waited}s after the settle window -- this round FAILS the credential bar"
+			rm -f "${dir:-/tmp}/.creds-last"
+			return 1
+		fi
+		[ $(( waited % CREDS_POLL_REPORT )) = 0 ] && [ "$waited" -gt 0 ] \
+			&& say "  ...${waited}s, credentials not aligned yet"
+		sleep "$CREDS_POLL"
+		waited=$((waited + CREDS_POLL))
+	done
+}
+
+# Agent uptime in seconds, echoed, or empty if the agent cannot be reached. Kept separate from
+# the harvest so it can be sampled cheaply inside a poll.
+agent_uptime() {
+	local aip
+	aip="$(agent_harvest_ip)" || return 1
+	dsh "$aip" 'awk "{print \$1}" /proc/uptime' 2>/dev/null
+}
+
 one_round() {
 	local dir="$1"
 	nic ctrl >/dev/null
@@ -593,7 +641,7 @@ one_round() {
 
 	# Last, and it decides the round. Reaching the internet proves the bSTA associated; it says
 	# nothing about whether the agent was ever configured as a mesh AP.
-	creds_check "$dir"
+	creds_wait "$dir"
 }
 
 # --- entry point -----------------------------------------------------------------------

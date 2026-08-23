@@ -179,6 +179,26 @@ seconds before harvesting. Harvesting on the online edge cut one 26082217 artefa
 and lost a bSTA drop at `t=237`: the saved logs said the round ended clean, and the live log read
 minutes later said it had not.
 
+**The credential bar is polled, not sampled once.** A round ends with `creds_wait`, which
+re-runs the credential comparison every `CREDS_POLL` seconds (15) for up to `CREDS_DEADLINE`
+(180 s) after the settle window, and reports the agent uptime at which every BSS finally matched
+(also written to `creds-uptime` in the artefact dir). It is a poll because the credentials do not
+always arrive on the agent's first registration pass: on `26082314` r17 the agent was reachable at
+uptime 216.4, its registration stalled in `WAIT_FOR_BACKHAUL_MANAGER_REGISTER_RESPONSE (7)`,
+`lsmesh-sta-iface-repair` killed `beerocks_agent` (attempt 1/2) — and the CAP's SSIDs landed on all
+three BSSes about 70 s after the 60 s settle window had closed. The single-shot check recorded that
+round as FAIL; a re-check minutes later was a clean PASS. A single shot measures when we happened
+to look, not when the event happened.
+
+**Which console line means "everything is ready"?** Neither of the two obvious candidates.
+`fronthaul credentials persisted to UCI` is `wifi_monitor` stashing what it learned from the
+backhaul — in r17 the fronthaul BSSes were still on the factory `Linksys2155E6` at that moment.
+`legalised HT40 ...` is a side effect of hostapd being reconfigured, so it correlates with the
+apply but states nothing about the result. The two authoritative facts are `prplmesh_cli -c status`
+reporting `current state: OPERATIONAL (15)` with a `Fronthaul: interface` entry per radio, and the
+driver carrying the controller's SSIDs on every BSS (`iwinfo <bss> info`) — which is exactly what
+`creds` checks and what `creds_wait` now times.
+
 **A failed round aborts on the controller's verdict, not on `DEADLINE`.** Every progress line now
 carries `onboarding::state`, `onboarding::result` and `onboarding::counters` read from the
 controller, and `state=done` with `result=failed` ends the round immediately. This matters twice
