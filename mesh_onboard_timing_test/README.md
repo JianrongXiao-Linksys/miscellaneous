@@ -8,6 +8,9 @@ The number this produces is comparable between firmware builds, which is the poi
 "did onboarding succeed" (the controller will tell you that, optimistically); it is "how long
 until the node is useful, measured from the node itself".
 
+**Paused as of 2026-08-22 — see [STATUS.md](STATUS.md)** for the bench state, the open bug (the
+bhsta1 supplicant control socket) and where to pick it up.
+
 ## Topology
 
 ```
