@@ -597,6 +597,28 @@ creds_wait() {
 	done
 }
 
+# The agent's own onboarding verdict, published as sysevent tuples by wifi_monitor from build
+# 26082316 (firmware-bugs 061). Worth reporting next to the credential bar because it is not the
+# same test: it also requires the prplMesh FSM to be OPERATIONAL. The two disagreeing is a real
+# finding -- credentials on air with a non-OPERATIONAL agent, or the reverse -- not noise.
+# Silent-by-design on builds that do not publish the tuples.
+agent_self_verdict() {
+	local dir="${1:-}" aip out st detail ready
+	aip="$(agent_harvest_ip)" || return 0
+	# One ssh, not three: this runs at the end of every round and each round trip is ~0.3 s.
+	out="$(dsh "$aip" 'for k in agent_state agent_detail agent_ready_uptime; do
+		printf "%s=%s\n" "$k" "$(sysevent get onboarding::$k)"; done' 2>/dev/null)"
+	st="$(printf '%s\n' "$out" | sed -n 's/^agent_state=//p')"
+	detail="$(printf '%s\n' "$out" | sed -n 's/^agent_detail=//p')"
+	ready="$(printf '%s\n' "$out" | sed -n 's/^agent_ready_uptime=//p')"
+	[ -n "$dir" ] && printf '%s\n' "$out" > "$dir/agent-verdict.txt"
+	case "$st" in
+		ready) say "agent self-verdict: ready at agent uptime ${ready:-unknown}" ;;
+		'')    say "agent self-verdict: not published by this build (onboarding::agent_state is empty)" ;;
+		*)     say "agent self-verdict: $st -- ${detail:-no reason given}" ;;
+	esac
+}
+
 # Agent uptime in seconds, echoed, or empty if the agent cannot be reached. Kept separate from
 # the harvest so it can be sampled cheaply inside a poll.
 agent_uptime() {
@@ -641,7 +663,13 @@ one_round() {
 
 	# Last, and it decides the round. Reaching the internet proves the bSTA associated; it says
 	# nothing about whether the agent was ever configured as a mesh AP.
-	creds_wait "$dir"
+	local rc
+	creds_wait "$dir"; rc=$?
+
+	# Reported after the bar it cross-checks, and never allowed to change the round's verdict:
+	# the harness owns the pass/fail, the node's self-report is evidence.
+	agent_self_verdict "$dir"
+	return "$rc"
 }
 
 # --- entry point -----------------------------------------------------------------------

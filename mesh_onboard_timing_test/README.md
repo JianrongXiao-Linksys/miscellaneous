@@ -199,6 +199,22 @@ reporting `current state: OPERATIONAL (15)` with a `Fronthaul: interface` entry 
 driver carrying the controller's SSIDs on every BSS (`iwinfo <bss> info`) — which is exactly what
 `creds` checks and what `creds_wait` now times.
 
+From firmware build `26082316` the agent says it itself. `wifi_monitor` publishes
+`onboarding::agent_state` (`ready`|`incomplete`), `onboarding::agent_detail` (why not, empty when
+ready) and `onboarding::agent_ready_uptime`, and prints one console line per change:
+
+```
+[t=220.06] onboard: still not complete — the prplMesh agent is WAIT_FOR_BACKHAUL_MANAGER_CONNECTED_NOTIFICATION (12)
+[t=276.93] onboard: READY — prplMesh agent OPERATIONAL and every enabled Multi-AP BSS on air with the controller's credentials
+```
+
+Every round now ends by reading those tuples back (`agent self-verdict: ...`, also saved as
+`agent-verdict.txt` in the artefact dir). It is reported **after** the credential bar and is never
+allowed to change the round's pass/fail: the harness owns the verdict, the node's self-report is
+evidence. The two tests are deliberately not identical — the node's own test additionally requires
+the prplMesh FSM to be `OPERATIONAL` — so a disagreement is a finding worth chasing, not noise.
+On builds without the tuples the line says so and the round is unaffected.
+
 **A failed round aborts on the controller's verdict, not on `DEADLINE`.** Every progress line now
 carries `onboarding::state`, `onboarding::result` and `onboarding::counters` read from the
 controller, and `state=done` with `result=failed` ends the round immediately. This matters twice
