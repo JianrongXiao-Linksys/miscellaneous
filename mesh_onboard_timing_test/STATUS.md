@@ -1,99 +1,138 @@
-# Status — paused 2026-08-22, evening (America/Los_Angeles)
+# Status — 2026-08-25, morning (America/Los_Angeles)
 
-Testing is **paused** at Jianrong's request. Nothing is running: no harness round, no build.
-Both nodes are flashed with **26082225** (`md5 41858dc969c2ddad0698bc327f686149`).
+Nothing is running: no harness round, no build, no `ssh` session held open. The last activity was a
+four-round `run -n 4` that finished at 09:14.
+
+Both nodes are flashed with **26082508**
+(`FW_Pinnacle2.0_v2.0.1.26082508_release.img`, `md5 fb6269987b08c4ec9f256009e435324b`,
+45,777,720 bytes, built 08:09 today). No round artefact records the build version — see
+*Harness gaps* — so that attribution rests on the flash sequence, not on the evidence in the
+artefacts.
+
+The agent is left **onboarded** (round 04 passed): both fronthaul BSSes on the controller's
+`Linksys00003`, backhaul `COMPLETED` to `74:12:13:21:53:8c`, internet and gateway `ok`.
 
 ## Bench state as left
 
 | node | address | version | state |
 |---|---|---|---|
-| controller `74:12:13:21:53:88` | `192.168.1.1` behind `Wired connection 2` (`192.168.1.254`) | 26082225 | up, WAN up, 3 BSSes (2.4 fBSS, 5 fBSS, 5 bBSS) |
-| agent `74:12:13:21:55:e6` | `192.168.1.1` behind `Wired connection 3` (`192.168.1.9`) | 26082225 | **unconfigured** — r13 was factory reset and its onboarding failed |
+| controller `74:12:13:21:53:88` | `192.168.1.1` behind `Wired connection 2` (host `192.168.1.254`) | 26082508 | up, WAN up, 3 BSSes (2.4 fBSS, 5 fBSS, 5 bBSS) |
+| agent `74:12:13:21:55:e6` | leased `192.168.1.111` behind `Wired connection 3` (host `192.168.1.9`) | 26082508 | onboarded — `agent_onboarded=yes`, `_elapsed=79`, `_uptime=255` |
 
-The host NIC left up is the **agent** one. `./onboard-timing-test.sh nic ctrl` before touching the
-controller — and never act on `192.168.1.1` without the MAC guard.
+**Both host NICs are up at once**, both on `192.168.1.0/24`, and the agent NIC wins the default
+route (`192.168.1.1 dev enx24f5a2f17025 metric 50` vs `... enx24f5a2f20603 metric 500`). So an
+unqualified `ssh root@192.168.1.1` from this host reaches **whichever node answers on the agent
+segment**, not necessarily the controller. Run `./onboard-timing-test.sh nic ctrl` before touching
+the controller, and never act on `192.168.1.1` without the MAC guard
+(`./onboard-timing-test.sh identify <ip>`).
 
 ## Where the work stands
 
-Reachability is basically solved: 136.9 s (26082215) → 21.2 s (26082225). The open problem is that
-reachability was never the whole bar.
+The bug this file used to describe as live — `/var/run/wpa_supplicant/bhsta1` missing after the pair
+press — is **fixed and no longer reproducing**. On all six rounds below the bSTA associates 4.0 s
+after `wps_pbc`, and the credential is persisted.
 
-### The live bug — the bSTA supplicant control socket
+Reachability is no longer the interesting number either. The node now publishes its own verdict
+(`onboarding::agent_onboarded*`), and on 26082508 that verdict is **stable**: 78, 79, 88 and 133 s
+from the GATT onboard command, against a 150 s budget.
 
-`/var/run/wpa_supplicant/bhsta1` does not exist after the pair press, and everything downstream of
-prplMesh needs it.
+### The six rounds on 26082508
 
-Evidence, agent, 26082225 r13 (`/tmp/ble-onboard.log`):
+`ready_at` is measured by the harness from **its** trigger; `_elapsed` is measured by the node from
+the GATT command. The difference is the time the box takes to accept the BLE onboard request after
+the harness fires it, and it is where nearly all of `ready_at`'s variance lives.
+
+| artefacts | `ready_at` | node `_elapsed` | BLE-accept latency | harness verdict | node verdict |
+|---|---|---|---|---|---|
+| `260825-0832/round-01` | 172 s | 133 | 39 s | pass, **over the 150 s budget** | `yes` at t=278.41 |
+| `260825-0845/round-01` | never | — | — | **fail** at the 300 s deadline | `no` at the deadline, latched `yes` 1.6 s later (t=301.75) |
+| `260825-0856/round-01` | 140 s | 88 | 52 s | pass, in budget | `yes` at t=249.82 |
+| `260825-0856/round-02` | 116 s | 78 | 38 s | pass, in budget — **best of the series** | `yes` at t=218.41 |
+| `260825-0856/round-03` | 68 s | — | — | pass (fastest `ready_at` ever recorded) | **`no`** at harvest — see below |
+| `260825-0856/round-04` | 154 s | 79 | 75 s | pass, 4 s over budget | `yes` at t=255.27 |
+
+Read that table as: **the node's onboarding is now consistent (78–88 s) and the two over-budget
+rounds are over budget because of BLE-accept latency (75 s on round 04), not because onboarding got
+slower.** Only `260825-0832/round-01` (133 s) is a genuinely slow onboard, and it is the round with
+the VAP fold → rebuild → bhsta drop → prplMesh state 0 sequence.
+
+### The live problem — the orphan VAP (`wlan1_2`)
+
+Two of six rounds hit it, and it is prplMesh-side; the fix is QCA's.
+
+`beerocks_ap_manager` applies the M2 to a **brand-new VAP** rather than to the netifd section the
+product is bound to:
 
 ```
-[t=68.77]  pre-arm: bhsta1 netdev up (0s after the apply); supplicant socket present
-[t=191.94] onboarding method=pbc — stopping advertisement, starting WPS-PBC
-[t=191.95] switching br-lan to DHCP client before WPS (nothing associated yet)
-[t=211.39] still short after 15s: bhsta1 supplicant socket — the br-lan reload undid the
-           pre-arm, so applying the radio after all
-[t=239.86] pre-WPS apply incomplete after 15s (absent: bhsta1 supplicant socket) — re-applying
-[t=268.35] ERROR: still absent after 15s: bhsta1 supplicant socket — continuing to WPS anyway
-[t=293.43] ERROR: bhsta interface bhsta1 failed to come up
+ap_wlan_hal_nl80211.cpp[3344] --> NEW VAP Ifname: wlan1_2 Index: 2 BSSID: 42:12:13:21:55:e8
+bpl_cfg_wifi.cpp[878]        --> Configuration for interface wlan1_2 not found
+bpl_cfg_wifi.cpp[967]        --> Section not found for interface wlan1_2, creating new section
+bpl_cfg_wifi.cpp[1249]      --> UCI credentials for wlan1_2 changed, updating
 ```
 
-So the socket is present at boot, is destroyed by `agent_lan_to_dhcp`'s netifd reload, and **two
-full `wifi reload` passes do not bring it back**. That is new information: it is not a race we can
-out-wait, and the fix-4 diagnostics in the daemon are what made it legible.
+- `260825-0845/round-01`: the orphan is created at t=189.4, terminated at t=192.3 and removed at
+  t=195.3. That **lifecycle** — created, given the credentials, then torn down — is what cost the
+  round; the round failed 1.6 s past the deadline.
+- `260825-0856/round-03`: the orphan is created at t=226.3 and is **still on air at harvest**
+  (`VAP_PRESENT=… wlan1_2@5180=<backhaul-ssid>`), with its own UCI section
+  `wireless.iface_wlan0` (`ifname='wlan1_2'`, `multi_ap='1'`).
 
-What is known about the shape of it, from the agent, live:
+Round 03 is the one to look at, because the two verdicts disagree and both are behaving as
+designed:
 
-- one supplicant, netifd's global instance: `/usr/sbin/wpa_supplicant -n -s -g /var/run/wpa_supplicant/global` — no `-i`
-- `/var/run/wpa_supplicant/` contains **only** `global`
-- `/var/run/wpa_supplicant-bhsta1.conf` exists and **does** contain `ctrl_interface=/var/run/wpa_supplicant`, plus `wps_cred_processing=2`, `update_config=1`, `freq_list=...` — and **no `network={}` block**
-- `ubus list` **does** show `wpa_supplicant.bhsta1`, offering `reload`, `get_features`, `wps_start`, `wps_cancel`
-- the socket directory is `network:network drwxr-xr-x` and the supplicant runs as `network`, so permissions are not it
-- `logread` on the agent has no supplicant-side complaint about the control interface at all — the only lines are the consumer failing to open it
+- The **harness** said `pass` at 68 s. Its inventory checks that every expected VAP is present and
+  carries the right SSID; an *extra* VAP is not something it looks for (`VAP_MISSING=` empty, and
+  there is no `VAP_EXTRA` field).
+- The **node** said `agent_onboarded=no`, `detail=the Multi-AP BSSes do not yet carry the controller
+  credentials`. `_backhaul_bss_gap` runs `_backhaul_netifd_owned_iface` before any SSID test, and a
+  Multi-AP BSS on a name netifd never produced disqualifies the section outright — deliberately, per
+  firmware-bugs 070: the GUI, JNAP, TR-181 and WPS are all bound to the netifd sections.
 
-That combination is the puzzle to start from tomorrow: the interface is registered with the
-supplicant (ubus object present) and its config asks for a control socket, yet no socket is created.
+The harvest is 6.5 s after the orphan appeared, so this round does **not** prove the marker would
+have stayed `no` indefinitely — the orphan fold had not run inside the round window, and the round
+ended before it could. Settling that needs a round that is left alone for a minute past the pass,
+which the harness currently does not do.
 
-### What it costs — r12, the round that looked best and was not onboarded
-
-26082225 r12: reachability at **21.15 s**, and:
-
-- 89,643 identical `beerocks_backhaul: wpa_ctrl_open() failed, ctrl_iface_path: /var/run/wpa_supplicant/bhsta1` lines in an **11-second** window — a hot spin that also explains why `logread` loses every round
-- prplMesh agent stuck in `WAIT_FOR_BACKHAUL_MANAGER_CONNECTED_NOTIFICATION (12)`, never reaching `WAIT_FOR_AUTO_CONFIGURATION_COMPLETE (14)`
-- therefore **no WSC M2**, therefore no credential: the agent kept its factory `Linksys2155E6` on both fBSSes and a factory random SSID on its bBSS, while the CAP runs `Linksys00003`
-- so: no client could roam to that node, and no third node could onboard through it
-
-Correlation across saved rounds (`agent-state.txt` in each artefact dir):
-
-| round | build | agent fronthaul SSID | prplMesh state |
-|---|---|---|---|
-| r4 | 26082217 | `Linksys00003` (CAP's) | 14 |
-| r5 | 26082217 | `Linksys2155E6` (factory) | — |
-| r6, r7 | 26082220 | `Linksys00003` (CAP's) | 14 |
-| r10 | 26082223 | `Linksys2155E6` (factory) | 12 |
-| r12 | 26082225 | `Linksys2155E6` (factory) | 12 |
-
-The rounds that lost the credential are the ones that reached state 12 and stopped. Both pre-arm
-builds are in that group, and so is r5 — so the pre-arm is a strong suspect but not the only case.
-
-## Two candidate directions for tomorrow
-
-1. **Do not tear the socket down.** `agent_lan_to_dhcp` runs a netifd reload *before* WPS purely to
-   have a lease ready. Moving it after the association would keep the socket and also cut ~6.5 s
-   (4.46 s reload + 2 s guard) off the critical path. Risk: a reload while associated has dropped
-   the backhaul before — check the fix history first, this is exactly the area the "back and forth"
-   warning covers.
-2. **Make the socket come back.** Understand why a registered interface with `ctrl_interface=` set
-   produces no socket. `ubus call wpa_supplicant.bhsta1 reload` is the cheap thing to try, and
-   `wps_start` on that same object is a better arming path than `wpa_cli` regardless.
-
-Whatever the fix, the acceptance bar is now both bars, not one: reachability **and**
-`./onboard-timing-test.sh creds` reporting `aligned` on every fronthaul and backhaul BSS.
+`26082508`'s own recovery did work on that round: at t=224.19 the back-out trigger armed (UCI had
+the controller's fronthaul credentials while the runtime did not, agent in state 14), and at
+t=229.52 it cleared itself — "the runtime picked the controller's credentials up on its own after
+5s, no repair needed".
 
 ## Harness state
 
-Pushed through `a09ac00`. `creds` / `creds -o <dir>` is new and a round now fails on it.
+Pushed through `9373dcb`; `main` == `origin/main`. `inventory` (the exact-VAP-set check) and the
+per-round `agent-verdict.txt` readback are the newest additions.
 
-## Firmware commits — LOCAL ONLY, not pushed
+### Harness gaps — worth fixing before the next series
 
-`premium` feed (`store/sdk/qsdk/feeds/premium`):
-`31e0208, 2b50fdf, 07bd022, 091744b, a3f1829, d091bd1, e670269, 84fd7ef, 0d0c125, 7e797de,
-33704f4, af6f8f1, 82c4d65, 68f41b6` — and `core` feed `95e3039`.
+1. **No `build_version` in any artefact.** Nothing in a round directory says which firmware
+   produced it; build attribution is by flash sequence and memory only. Stamp
+   `/etc/routerinfo`'s `build_version` into `round-meta.txt` for both nodes.
+2. **No `VAP_EXTRA`.** An orphan VAP passes the inventory check silently (round 03). The check
+   should report VAPs present that are not in the expected set, and a round with one should not read
+   as clean.
+3. **`onboarding::agent_serviceable_uptime` is not harvested.** `agent_onboarded*` is read back, but
+   the serviceable timestamp — the number firmware-bugs 071 is about — still has to be dug out of
+   the timeline by hand.
+4. **`REPAIR_ATTEMPTS` is never written.** It is empty in all six rounds' `check-pass.txt`. Either
+   the field is not being populated or no repair has ever fired in a harvested round; both readings
+   need distinguishing, because the uplink guardian's recovery ladder is unverified on the DUT
+   precisely for this reason.
+5. **The uptime line in the timeline header can be nonsense.** `260825-0856/round-02` prints
+   `pairing triggered at t=1992324s of agent uptime` while `round-meta.txt` correctly records
+   `agent_uptime_at_trigger=101.04` — the header derives it from epochs, and the box's clock is
+   pre-NTP at that point (that round's boot epoch reads `2026-08-02`).
+6. **A round ends at the pass.** No post-pass settle window, which is what round 03 needed.
+
+## Firmware git state
+
+| tree | state |
+|---|---|
+| feed `premium` (`store/sdk/qsdk/feeds/premium`) | `d81399d`, at `origin/develop` — merged as feed_premium#10 |
+| feed `core` (`store/sdk/qsdk/feeds/core`) | `48ef213`, at `origin/develop` — merged as feed_core#11 |
+| targets tree | one **local-only** commit `69547d5` on `fix/065-bhsta-cred-single-instance-sdk-patch`, no PR — the `pgrep -f` single-instance guard for `prplmesh-bhsta-cred` as an `sdk_patches` entry. A fresh checkout still builds without it. |
+
+## Not in scope
+
+TR-181 / bbfdm / wifidmd and GUI code are out of scope for the PR — the delivered contract is
+sysevent-over-ubus (`onboarding::pair` / `::state`), not a TR-181 or EasyMesh object.

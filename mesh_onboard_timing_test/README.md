@@ -8,8 +8,9 @@ The number this produces is comparable between firmware builds, which is the poi
 "did onboarding succeed" (the controller will tell you that, optimistically); it is "how long
 until the node is useful, measured from the node itself".
 
-**Paused as of 2026-08-22 — see [STATUS.md](STATUS.md)** for the bench state, the open bug (the
-bhsta1 supplicant control socket) and where to pick it up.
+**Current as of 2026-08-25 — see [STATUS.md](STATUS.md)** for the bench state, the six rounds on
+`26082508`, the live problem (prplMesh's orphan `wlan1_2` VAP) and the harness gaps to close before
+the next series.
 
 ## Topology
 
