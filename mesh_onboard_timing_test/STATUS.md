@@ -84,9 +84,17 @@ designed:
   carries the right SSID; an *extra* VAP is not something it looks for (`VAP_MISSING=` empty, and
   there is no `VAP_EXTRA` field).
 - The **node** said `agent_onboarded=no`, `detail=the Multi-AP BSSes do not yet carry the controller
-  credentials`. `_backhaul_bss_gap` runs `_backhaul_netifd_owned_iface` before any SSID test, and a
-  Multi-AP BSS on a name netifd never produced disqualifies the section outright — deliberately, per
+  credentials`. `_backhaul_bss_gap` ran `_backhaul_netifd_owned_iface` before any SSID test, and a
+  Multi-AP BSS on a name netifd never produced disqualified the section outright — deliberately, per
   firmware-bugs 070: the GUI, JNAP, TR-181 and WPS are all bound to the netifd sections.
+
+**The firmware side of this is already fixed, after these rounds were run.** `b84e27d` (premium feed,
+branch `fix/076-orphan-vap-not-our-business`, unpushed) makes the verdict **skip** a section netifd
+never created rather than fail on it, and moves removal to a sweep gated on
+`::agent_serviceable=yes` — the same premise was also making the fronthaul liveness ladder rebuild
+`radio0_band1` for the orphan, which is what cost `260825-0845` its ~36 s and its bSTA drop. See
+firmware-bugs 076. So the harness is now the side that needs changing: a round carrying an orphan
+should be *reported* as such, not passed silently.
 
 The harvest is 6.5 s after the orphan appeared, so this round does **not** prove the marker would
 have stayed `no` indefinitely — the orphan fold had not run inside the round window, and the round
@@ -109,8 +117,10 @@ per-round `agent-verdict.txt` readback are the newest additions.
    produced it; build attribution is by flash sequence and memory only. Stamp
    `/etc/routerinfo`'s `build_version` into `round-meta.txt` for both nodes.
 2. **No `VAP_EXTRA`.** An orphan VAP passes the inventory check silently (round 03). The check
-   should report VAPs present that are not in the expected set, and a round with one should not read
-   as clean.
+   should report VAPs present that are not in the expected set. **Report, do not fail:** since
+   `b84e27d` the firmware deliberately treats an orphan as none of its business, so a round that
+   carried one and still onboarded correctly *is* a pass — the field exists so the round can be
+   attributed, and so the sweep's effect can be seen.
 3. **`onboarding::agent_serviceable_uptime` is not harvested.** `agent_onboarded*` is read back, but
    the serviceable timestamp — the number firmware-bugs 071 is about — still has to be dug out of
    the timeline by hand.
@@ -128,7 +138,7 @@ per-round `agent-verdict.txt` readback are the newest additions.
 
 | tree | state |
 |---|---|
-| feed `premium` (`store/sdk/qsdk/feeds/premium`) | `d81399d`, at `origin/develop` — merged as feed_premium#10 |
+| feed `premium` (`store/sdk/qsdk/feeds/premium`) | `b84e27d` on **local** branch `fix/076-orphan-vap-not-our-business`, one commit ahead of `d81399d` (`origin/develop`, merged as feed_premium#10) — the 076 orphan-VAP fix, no PR yet, **not in `26082508`** |
 | feed `core` (`store/sdk/qsdk/feeds/core`) | `48ef213`, at `origin/develop` — merged as feed_core#11 |
 | targets tree | one **local-only** commit `69547d5` on `fix/065-bhsta-cred-single-instance-sdk-patch`, no PR — the `pgrep -f` single-instance guard for `prplmesh-bhsta-cred` as an `sdk_patches` entry. A fresh checkout still builds without it. |
 
