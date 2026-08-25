@@ -89,6 +89,12 @@ Two further facts that surprised us on this bench:
 # Harvest the agent and print the timeline for a round that already happened
 ./onboard-timing-test.sh measure -o /tmp/round-1
 
+# Compare every fronthaul and backhaul BSS on the agent against the controller
+./onboard-timing-test.sh creds -o /tmp/round-1
+
+# Enumerate the agent's VAPs and check them against the six inventory rules
+./onboard-timing-test.sh inventory -o /tmp/round-1
+
 # One full round: reset agent -> wait for boot -> trigger -> wait for online -> measure
 ./onboard-timing-test.sh round -o /tmp/round-1
 
@@ -112,6 +118,34 @@ Everything is env-overridable for a different bench:
 | `SETTLE_WATCH` | `60` | seconds to keep watching after the agent is reachable, before harvesting |
 | `OUTROOT` | `~/code/claude/onboard-tests` | where artefacts go |
 | `BACKHAUL_SSID` | unset | if set, redacted out of every harvested file |
+
+## The inventory check — the right credentials on the wrong VAP is not a pass
+
+`creds` answers *are the credentials right?* It cannot answer *are they on the interfaces the
+product is bound to?*, and on `26082410` round 33 the difference was the whole bug: the agent
+reached `OPERATIONAL`, `bhsta1` was `COMPLETED`, every SSID matched the controller — and five AP
+BSSes were on the air, because prplMesh had applied radio 1's M2 to two brand-new VAPs
+(`wlan1_2`, `wlan1_3`) instead of the existing ones. The GUI, JNAP, TR-181 and WPS are all bound to
+the netifd sections, which were still beaconing the factory SSID. See ledger bug 070.
+
+`inventory` enumerates what is actually there — on-air BSSes with their `multi_ap` role and owning
+UCI section, the bSTA's supplicant state, the generated hostapd confs, and the UCI AP sections — and
+applies six rules. Any violation prints a `PROBLEM:` line and fails the round.
+
+| rule | what it asserts | what it catches |
+|---|---|---|
+| R1 | every AP BSS is named `phy<n>.<n>-<n>` | a VAP bwl allocated behind netifd's back — the exact 070 signature, since bwl's allocator names them `wlan<radio>_<n>` and nothing else produces either form |
+| R2 | exactly one fronthaul BSS per radio | a duplicate fronthaul; both naming forms fold onto the same radio key first, or the duplicate counts as its own radio and the rule is silently satisfied |
+| R3 | exactly one backhaul BSS on the node | a second bBSS, or none |
+| R4 | exactly one bSTA, in `COMPLETED` | a backhaul that never associated, or a duplicate supplicant interface |
+| R5 | one generated conf per radio, `hostapd-phy<n>.<n>.conf` | a conf written for a VAP netifd never asked for |
+| R6 | no orphan UCI AP section, and no on-air AP without one | the config-side half of R1, in both directions |
+
+Note that R4 is about the *station*, not a BSS: the bSTA is deliberately excluded from the
+firmware's own BSS verdict, because `wireless.bhsta` carries `multi_ap='1'` and is therefore
+enumerated as a backhaul section even though its `ifname` is a station interface. Judging it as a
+BSS is what made a healthy round-34 node report `incomplete` permanently — same ledger entry, the
+regression section.
 
 ## What "onboarded" means here
 

@@ -14,6 +14,8 @@
 #   onboard-timing-test.sh flash <img> <ip>        scp + md5 verify + sysupgrade
 #   onboard-timing-test.sh reset <ip>              MAC-guarded factory reset
 #   onboard-timing-test.sh trigger                 fire onboarding::pair=start on the controller
+#   onboard-timing-test.sh creds [-o dir]          compare the agent's BSS credentials to the CAP's
+#   onboard-timing-test.sh inventory [-o dir]      assert the agent's VAP/bSTA set is EXACTLY right
 #   onboard-timing-test.sh measure [-o dir]        harvest the agent and print the timeline
 #   onboard-timing-test.sh round [-o dir]          reset agent -> trigger -> measure (one round)
 #   onboard-timing-test.sh run [-n N] [-o dir]     N rounds back to back
@@ -390,7 +392,7 @@ timeline() {
 	printf '%10s  %8s  %s\n' "t(s)" "delta" "event"
 	# One awk pass so the rows come out in t order regardless of which file they came from.
 	grep -hoE '\[t=[0-9.]+\].*' $logs 2>/dev/null \
-	  | grep -E 'GATT command received|starting WPS-PBC|triggering WPS-PBC|WPS-PBC completed|fronthaul credentials persisted|replacement beerocks_agent|back-out|recovered \(was disconnected|reassociating now|legalised HT40|rebuilding|hostapd still reports|activation grace|backhaul: connected on boot' \
+	  | grep -E 'GATT command received|starting WPS-PBC|triggering WPS-PBC|WPS-PBC completed|fronthaul credentials persisted|replacement beerocks_agent|back-out|recovered \(was disconnected|reassociating now|legalised HT40|rebuilding|hostapd still reports|activation grace|backhaul: connected on boot|onboard: READY' \
 	  | sed -n 's/^\[t=\([0-9.]*\)\] *\(.*\)$/\1|\2/p' \
 	  | sort -t'|' -k1,1g -u \
 	  | awk -F'|' -v t0="$t0" '$1+0 >= t0+0 { printf "%10.2f  %+8.2f  %s\n", $1, $1-t0, $2 }'
@@ -408,6 +410,21 @@ timeline() {
 			'BEGIN { printf "[onboard] GATT -> agent online (pings controller AND internet): %.2f - %.2f = %.2f s (+/-%ds, one poll)\n", b, a, b-a, p }'
 	else
 		say "no online-uptime recorded for this round -- run 'round', not 'measure', for the headline number"
+	fi
+
+	# THE SECOND HEADLINE, and the one that has been quoted by hand for six rounds. `onboard: READY`
+	# is wifi_monitor's own completeness verdict: prplMesh OPERATIONAL *and* every enabled Multi-AP
+	# BSS on air with the controller's credentials. It lands well after the node is usable -- r32
+	# measured +56.80 s to online and +141.05 s to READY -- so the two numbers are both reported and
+	# neither is allowed to stand in for the other.
+	local ready
+	ready="$(grep -hoE '\[t=[0-9.]+\] onboard: READY' $logs 2>/dev/null \
+	         | head -1 | sed -n 's/^\[t=\([0-9.]*\)\].*/\1/p')"
+	if [ -n "$ready" ]; then
+		awk -v a="$t0" -v b="$ready" \
+			'BEGIN { printf "[onboard] GATT -> onboard: READY (prplMesh OPERATIONAL and every Multi-AP BSS correct): %.2f - %.2f = %.2f s\n", b, a, b-a }'
+	else
+		say "GATT -> onboard: READY: never reached in the harvested window -- either the harvest closed too early (raise SETTLE_WATCH) or the node never finished"
 	fi
 
 	# Secondary, and reported with its caveat. The settle line is only as good as the last
@@ -564,6 +581,146 @@ creds_check() {
 	return "$rc"
 }
 
+# --- the VAP / bSTA inventory ------------------------------------------------------------------
+#
+# creds_check asks "does the BSS the controller expects carry the right credentials". It cannot
+# ask "is this the ONLY BSS", and 26082410 round 33 is why that second question needs its own
+# check: prplMesh applied the radio-1 M2 by ALLOCATING TWO NEW VAPs (wlan1_2, wlan1_3) with the
+# controller's credentials and writing two new UCI sections for them, while the netifd-owned
+# phy00.1-0 and phy00.1-1 kept beaconing this unit's factory SSIDs. The radio ended up with four
+# AP BSSes: two correct duplicates and two stale ones a client can still see and join.
+#
+# creds_check survived that round only by luck. It keys on (radio, role) and takes the FIRST
+# match; the duplicates land under radio "phy00.1.wlan1_2" because their conf file is
+# hostapd-phy00.1.wlan1_2.conf, so they simply never matched and the stale BSS was compared. Had
+# the duplicate been written into hostapd-phy00.1.conf instead, the round would have passed with
+# two factory BSSes on the air. A check that passes for that reason is not a check.
+#
+# The rules below are deliberately about OWNERSHIP and COUNT, not about a hardcoded interface
+# list, so they carry to another device:
+#
+#   R1  every AP BSS on the air is named phy<R>.<B>-<N>. That is netifd's naming, i.e. the BSS
+#       came from a UCI wifi-iface. wlan<R>_<N> is bwl allocating a VAP behind netifd's back,
+#       which is the whole defect -- the name IS the evidence.
+#   R2  exactly one fronthaul (multi_ap=2) BSS per enabled radio.
+#   R3  exactly one backhaul (multi_ap=1|3) BSS on the node.
+#   R4  exactly one bSTA, associated, and on the same radio as the bBSS.
+#   R5  one generated conf per radio: hostapd-phy<R>.<B>.conf and nothing else. A third dot
+#       component (hostapd-phy00.1.wlan1_2.conf) is a VAP netifd never asked for.
+#   R6  every enabled AP wifi-iface section in UCI is on the air, and no more of them exist than
+#       there are BSSes -- an orphan section is a VAP that comes back on the next `wifi up`.
+#
+# These describe an AGENT. A CAP legitimately runs a bBSS with no bSTA at all, so R3 and R4 do not
+# apply to it and this check is never pointed at the controller.
+INVENTORY_REMOTE=$(cat <<'REMOTE'
+for d in /sys/class/net/*; do
+    ifn=${d##*/}
+    [ -d "$d/phy80211" ] || continue
+    type=$(iw dev "$ifn" info 2>/dev/null | sed -n 's/^[[:space:]]*type //p' | head -1)
+    ssid=$(iw dev "$ifn" info 2>/dev/null | sed -n 's/^[[:space:]]*ssid //p' | head -1)
+    map=$(hostapd_cli -i "$ifn" get_config 2>/dev/null | sed -n 's/^multi_ap=//p' | head -1)
+    sec=$(uci show wireless 2>/dev/null | sed -n "s/^wireless\.\([^.]*\)\.ifname='$ifn'\$/\1/p" | head -1)
+    printf 'IF|%s|%s|%s|%s|%s\n' "$ifn" "${type:-unknown}" "${ssid:-(down)}" "${map:-none}" "${sec:-none}"
+done
+for f in /var/run/hostapd-*.conf; do
+    [ -f "$f" ] && printf 'CONF|%s\n' "${f##*/}"
+done
+# Enabled AP sections in UCI, whether or not they made it onto the air.
+uci show wireless 2>/dev/null | sed -n "s/^wireless\.\([^.]*\)\.mode='ap'\$/\1/p" | while read -r s; do
+    [ "$(uci -q get wireless.$s.disabled)" = "1" ] && continue
+    printf 'UCIAP|%s|%s|%s\n' "$s" "$(uci -q get wireless.$s.ifname)" "$(uci -q get wireless.$s.multi_ap)"
+done
+for i in $(ls -1 /var/run/wpa_supplicant/ 2>/dev/null); do
+    # `global` is wpa_supplicant's own control socket, not a station interface, and so is any
+    # leftover *.sock. Counting them would make "exactly one bSTA" unsatisfiable by construction.
+    case "$i" in global|*.sock) continue ;; esac
+    [ -d "/sys/class/net/$i" ] || continue
+    st=$(wpa_cli -p /var/run/wpa_supplicant -i "$i" status 2>/dev/null)
+    printf 'STA|%s|%s|%s\n' "$i" \
+        "$(printf '%s' "$st" | sed -n 's/^wpa_state=//p' | head -1)" \
+        "$(printf '%s' "$st" | sed -n 's/^ssid=//p' | head -1)"
+done
+REMOTE
+)
+
+inventory_dump() {
+	local b64
+	b64="$(printf '%s\n' "$INVENTORY_REMOTE" | base64 -w0)"
+	dsh "$1" "echo ${b64} | base64 -d | sh"
+}
+
+inventory_check() {
+	local dir="${1:-}" aip inv rc=0
+	if ! aip="$(agent_harvest_ip)"; then
+		say "inventory check: the agent is unreachable -- cannot enumerate its VAPs"
+		return 1
+	fi
+	inv="$(inventory_dump "$aip")"
+	[ -n "$inv" ] || { say "inventory check: the agent returned no interfaces"; return 1; }
+
+	{
+		printf 'kind   iface        type    role  uci-section       ssid\n'
+		printf '%s\n' "$inv" | awk -F'|' '$1=="IF" {
+			role = ($5=="2") ? "fh" : ($5=="1" || $5=="3") ? "bh" : ($2=="managed") ? "sta" : "-"
+			printf "%-6s %-12s %-7s %-5s %-17s %s\n", "IF", $2, $3, role, $6, $4
+		}'
+		printf '\n'
+		printf '%s\n' "$inv" | awk -F'|' '$1=="STA" { printf "%-6s %-12s %-7s %-5s %-17s %s\n", "STA", $2, $3, "-", "-", $4 }'
+		printf '\n'
+
+		# R1 -- ownership by name.
+		printf '%s\n' "$inv" | awk -F'|' '$1=="IF" && $3=="AP" {
+			if ($2 !~ /^phy[0-9]+\.[0-9]+-[0-9]+$/)
+				printf "PROBLEM: %s is an AP BSS netifd never created (UCI section %s) -- bwl allocated a VAP behind netifd, so this radio now serves a duplicate the GUI, TR-181 and WPS know nothing about\n", $2, $6
+		}'
+		# R2 -- one fronthaul per radio. Both naming forms have to fold onto the same radio key
+		# or the duplicate counts as its own radio and this rule is silently satisfied:
+		# phy00.1-0 -> radio 1, wlan1_2 -> radio 1.
+		printf '%s\n' "$inv" | awk -F'|' '$1=="IF" && $5=="2" {
+			r = "?"
+			if ($2 ~ /^phy[0-9]+\.[0-9]+-[0-9]+$/) { split($2, a, "."); split(a[2], b, "-"); r = b[1] }
+			else if ($2 ~ /^wlan[0-9]+_[0-9]+$/)   { split($2, a, "_"); r = substr(a[1], 5) }
+			n[r]++
+		} END { for (r in n) if (n[r] != 1) printf "PROBLEM: radio %s carries %d fronthaul BSSes, expected exactly 1\n", r, n[r] }'
+		# R3 -- one backhaul BSS.
+		printf '%s\n' "$inv" | awk -F'|' '$1=="IF" && ($5=="1" || $5=="3") { n++ }
+			END { if (n != 1) printf "PROBLEM: %d backhaul BSSes on the node, expected exactly 1\n", n+0 }'
+		# R4 -- one bSTA, associated.
+		printf '%s\n' "$inv" | awk -F'|' '$1=="STA" { n++; if ($3 != "COMPLETED")
+				printf "PROBLEM: bSTA %s is %s, not COMPLETED\n", $2, ($3==""?"in no state":$3) }
+			END { if (n != 1) printf "PROBLEM: %d bSTA supplicant interfaces, expected exactly 1\n", n+0 }'
+		# R5 -- one generated conf per radio.
+		printf '%s\n' "$inv" | awk -F'|' '$1=="CONF" {
+			if ($2 !~ /^hostapd-phy[0-9]+\.[0-9]+\.conf$/)
+				printf "PROBLEM: %s is a generated conf for a VAP netifd never asked for\n", $2
+		}'
+		# R6 -- no orphan UCI AP section, and no on-air AP without one.
+		printf '%s\n' "$inv" | awk -F'|' '
+			$1=="IF" && $3=="AP" { onair[$2]=1; sec[$2]=$6 }
+			$1=="UCIAP" { ucisec[$2]=$3 }
+			END {
+				for (s in ucisec) if (ucisec[s] != "" && !(ucisec[s] in onair))
+					printf "PROBLEM: UCI section %s (ifname %s) is an enabled AP that is not on the air -- it returns on the next `wifi up`\n", s, ucisec[s]
+				for (i in onair) if (sec[i] == "none")
+					printf "PROBLEM: %s is on the air with no UCI section at all -- nothing owns it and nothing will clean it up\n", i
+			}'
+	} > /tmp/.inv-report.$$
+
+	cat /tmp/.inv-report.$$
+	grep -q '^PROBLEM:' /tmp/.inv-report.$$ && rc=1
+	if [ -n "$dir" ]; then
+		mkdir -p "$dir"
+		redact < /tmp/.inv-report.$$ > "$dir/inventory.txt"
+	fi
+	rm -f /tmp/.inv-report.$$
+	if [ "$rc" = "0" ]; then
+		say "inventory check: PASS -- one fronthaul per radio, one bBSS, one associated bSTA, no extra VAP"
+	else
+		say "inventory check: FAIL -- the agent is carrying VAPs it should not have"
+	fi
+	return "$rc"
+}
+
 # Poll creds_check until every BSS carries the controller's credentials, and report the agent
 # uptime at which that became true. This, not reachability, is when onboarding is finished.
 #
@@ -663,8 +820,15 @@ one_round() {
 
 	# Last, and it decides the round. Reaching the internet proves the bSTA associated; it says
 	# nothing about whether the agent was ever configured as a mesh AP.
-	local rc
+	local rc irc
 	creds_wait "$dir"; rc=$?
+
+	# And then the question creds_wait cannot ask: are these the ONLY VAPs. Run it even when the
+	# credential bar already failed -- a round that fails both ways should say so, because "the
+	# right credentials on a duplicate VAP" and "the wrong credentials" are different defects with
+	# different fixes, and 26082410 round 33 was both at once.
+	inventory_check "$dir"; irc=$?
+	[ "$irc" = "0" ] || rc=1
 
 	# Reported after the bar it cross-checks, and never allowed to change the round's verdict:
 	# the harness owns the pass/fail, the node's self-report is evidence.
@@ -685,6 +849,11 @@ case "$cmd" in
 		dir=""
 		[ "${1:-}" = "-o" ] && dir="$2"
 		creds_check "$dir"
+		;;
+	inventory)
+		dir=""
+		[ "${1:-}" = "-o" ] && dir="$2"
+		inventory_check "$dir"
 		;;
 	measure)
 		dir="${OUTROOT}/manual-$(date +%y%m%d%H%M)"
