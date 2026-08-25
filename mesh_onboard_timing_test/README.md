@@ -8,9 +8,15 @@ The number this produces is comparable between firmware builds, which is the poi
 "did onboarding succeed" (the controller will tell you that, optimistically); it is "how long
 until the node is useful, measured from the node itself".
 
-**Current as of 2026-08-25 — see [STATUS.md](STATUS.md)** for the bench state, the six rounds on
-`26082508`, the live problem (prplMesh's orphan `wlan1_2` VAP) and the harness gaps to close before
-the next series.
+**Current as of 2026-08-25 — see [STATUS.md](STATUS.md)** for the bench state, the seven rounds on
+`26082510`/`26082511` (four passes on `26082511`, best agent-side onboard 50 s), the seven harness
+gaps now closed and proven round-by-round, and the one finding they produced immediately:
+`onboarding::agent_serviceable_uptime` is re-stamped on every transition, so a round with a backhaul
+flap reports a serviceable time 35 s later than the true one.
+
+Note that the harness this file describes is the **live** pair `~/bin/onboard-test.sh` +
+`~/bin/onboard-check.sh`, which is untracked and outside any repo; the `onboard-timing-test.sh` in
+this directory is an older, different script. STATUS.md carries that as the first remaining gap.
 
 ## Topology
 

@@ -1,146 +1,159 @@
-# Status — 2026-08-25, morning (America/Los_Angeles)
+# Status — 2026-08-25, midday (America/Los_Angeles)
 
 Nothing is running: no harness round, no build, no `ssh` session held open. The last activity was a
-four-round `run -n 4` that finished at 09:14.
+four-round `run -n 4` on `26082511` that finished at 11:10.
 
-Both nodes are flashed with **26082508**
-(`FW_Pinnacle2.0_v2.0.1.26082508_release.img`, `md5 fb6269987b08c4ec9f256009e435324b`,
-45,777,720 bytes, built 08:09 today). No round artefact records the build version — see
-*Harness gaps* — so that attribution rests on the flash sequence, not on the evidence in the
-artefacts.
+Both nodes are flashed with **26082511**, and this is the first series where that statement rests on
+the artefacts rather than on the flash sequence: `BUILD=26082511` is in every `check-*.txt`, and
+`build_version=26082511` is in both `agent-meta.txt` and `ctrl-meta.txt`.
 
 The agent is left **onboarded** (round 04 passed): both fronthaul BSSes on the controller's
-`Linksys00003`, backhaul `COMPLETED` to `74:12:13:21:53:8c`, internet and gateway `ok`.
+`Linksys00003`, backhaul `COMPLETED`, internet and gateway `ok`.
 
 ## Bench state as left
 
 | node | address | version | state |
 |---|---|---|---|
-| controller `74:12:13:21:53:88` | `192.168.1.1` behind `Wired connection 2` (host `192.168.1.254`) | 26082508 | up, WAN up, 3 BSSes (2.4 fBSS, 5 fBSS, 5 bBSS) |
-| agent `74:12:13:21:55:e6` | leased `192.168.1.111` behind `Wired connection 3` (host `192.168.1.9`) | 26082508 | onboarded — `agent_onboarded=yes`, `_elapsed=79`, `_uptime=255` |
+| controller `74:12:13:21:53:88` | `192.168.1.1` behind `Wired connection 2` (host `192.168.1.254`) | 26082511 | up, WAN up, 3 BSSes (2.4 fBSS, 5 fBSS, 5 bBSS) |
+| agent `74:12:13:21:55:e6` | leased `192.168.1.111` behind `Wired connection 3` (host `192.168.1.9`) | 26082511 | onboarded — `agent_onboarded=yes`, `_elapsed=78`, `_uptime=243` |
 
 **Both host NICs are up at once**, both on `192.168.1.0/24`, and the agent NIC wins the default
-route (`192.168.1.1 dev enx24f5a2f17025 metric 50` vs `... enx24f5a2f20603 metric 500`). So an
-unqualified `ssh root@192.168.1.1` from this host reaches **whichever node answers on the agent
-segment**, not necessarily the controller. Run `./onboard-timing-test.sh nic ctrl` before touching
-the controller, and never act on `192.168.1.1` without the MAC guard
-(`./onboard-timing-test.sh identify <ip>`).
+route. So an unqualified `ssh root@192.168.1.1` from this host reaches **whichever node answers on
+the agent segment**, not necessarily the controller. Run `nic ctrl` before touching the controller,
+and never act on `192.168.1.1` without the MAC guard (`identify <ip>`).
 
 ## Where the work stands
 
-The bug this file used to describe as live — `/var/run/wpa_supplicant/bhsta1` missing after the pair
-press — is **fixed and no longer reproducing**. On all six rounds below the bSTA associates 4.0 s
-after `wps_pbc`, and the credential is persisted.
+Reachability stopped being the interesting number a while ago; on these two builds the *harness's*
+number stopped being the interesting one too. The node publishes its own verdict
+(`onboarding::agent_onboarded*`), and every field the harness now harvests comes off the node.
 
-Reachability is no longer the interesting number either. The node now publishes its own verdict
-(`onboarding::agent_onboarded*`), and on 26082508 that verdict is **stable**: 78, 79, 88 and 133 s
-from the GATT onboard command, against a 150 s budget.
+### The seven rounds on 26082510 and 26082511
 
-### The six rounds on 26082508
+`ready_at` is the harness's number, measured from **its** trigger; `_elapsed` is the node's, measured
+from the GATT onboard command. The difference is how long the box takes to accept the BLE request
+after the harness fires it, and it is still where most of `ready_at`'s variance lives.
 
-`ready_at` is measured by the harness from **its** trigger; `_elapsed` is measured by the node from
-the GATT command. The difference is the time the box takes to accept the BLE onboard request after
-the harness fires it, and it is where nearly all of `ready_at`'s variance lives.
+| artefacts | build | `ready_at` | node `_elapsed` | serviceable | prplMesh `READY` | node verdict |
+|---|---|---|---|---|---|---|
+| `260825-1015/round-01` | 26082510 | 117 s | 82 | — | — | `yes` |
+| `260825-1015/round-02` | 26082510 | 89 s | 87 | — | — | `yes` |
+| `260825-1015/round-03` | 26082510 | never | — | — | — | fail — see firmware-bugs 078 |
+| `260825-1049/round-01` | 26082511 | 105 s | 61 | t=206 | t=260 | `yes` at t=206 |
+| `260825-1049/round-02` | 26082511 | 132 s | **50** | t=233 (**re-stamped**) | t=287 | `yes` at t=198 |
+| `260825-1049/round-03` | 26082511 | 121 s | 83 | t=227 | t=281 | `yes` at t=227 |
+| `260825-1049/round-04` | 26082511 | 117 s | 78 | t=243 | t=297 | `yes` at t=243 |
 
-| artefacts | `ready_at` | node `_elapsed` | BLE-accept latency | harness verdict | node verdict |
-|---|---|---|---|---|---|
-| `260825-0832/round-01` | 172 s | 133 | 39 s | pass, **over the 150 s budget** | `yes` at t=278.41 |
-| `260825-0845/round-01` | never | — | — | **fail** at the 300 s deadline | `no` at the deadline, latched `yes` 1.6 s later (t=301.75) |
-| `260825-0856/round-01` | 140 s | 88 | 52 s | pass, in budget | `yes` at t=249.82 |
-| `260825-0856/round-02` | 116 s | 78 | 38 s | pass, in budget — **best of the series** | `yes` at t=218.41 |
-| `260825-0856/round-03` | 68 s | — | — | pass (fastest `ready_at` ever recorded) | **`no`** at harvest — see below |
-| `260825-0856/round-04` | 154 s | 79 | 75 s | pass, 4 s over budget | `yes` at t=255.27 |
+Read that as: **four rounds, four passes on `26082511`, and 50 s is the best agent-side onboard ever
+measured here** (previous best 62 s). The four `_elapsed` values are 61 / 50 / 83 / 78 against a
+150 s budget.
 
-Read that table as: **the node's onboarding is now consistent (78–88 s) and the two over-budget
-rounds are over budget because of BLE-accept latency (75 s on round 04), not because onboarding got
-slower.** Only `260825-0832/round-01` (133 s) is a genuinely slow onboard, and it is the round with
-the VAP fold → rebuild → bhsta drop → prplMesh state 0 sequence.
+**prplMesh `OPERATIONAL` lands exactly 54 s after serviceable, in all four rounds** — 206→260,
+233→287, 227→281, 243→297. That is firmware-bugs 074's fixed per-radio timeout, now measured four
+times on one image with no variance at all, which is a stronger statement than the single 48 s figure
+074 carries. It is also only visible because of the settle window: at harvest (t≈209 on round 01)
+`agent_ready_uptime` was still empty in all four rounds, and every one of the four values above comes
+from `agent-verdict-settle.txt`.
 
-### The live problem — the orphan VAP (`wlan1_2`)
+### One finding the new fields produced immediately — `::agent_serviceable_uptime` is not latched
 
-Two of six rounds hit it, and it is prplMesh-side; the fix is QCA's.
-
-`beerocks_ap_manager` applies the M2 to a **brand-new VAP** rather than to the netifd section the
-product is bound to:
+`260825-1049/round-02` is the fastest round and it is the one that exposes this. The node latched
+`agent_onboarded` at t=198.79 (50 s from GATT). Then:
 
 ```
-ap_wlan_hal_nl80211.cpp[3344] --> NEW VAP Ifname: wlan1_2 Index: 2 BSSID: 42:12:13:21:55:e8
-bpl_cfg_wifi.cpp[878]        --> Configuration for interface wlan1_2 not found
-bpl_cfg_wifi.cpp[967]        --> Section not found for interface wlan1_2, creating new section
-bpl_cfg_wifi.cpp[1249]      --> UCI credentials for wlan1_2 changed, updating
+[t=214.51] backhaul: disconnected (state=DISCONNECTED) — starting recovery
+[t=214.52] backhaul: wpa_supplicant has 0 networks — injecting from UCI
+[t=218.09] backhaul: reconnect attempt 1/5
+[t=223.17] backhaul: recovered (was disconnected ~19s)
+[t=233.81] onboard: SERVICEABLE — every enabled Multi-AP BSS is on air with the controller's credentials
 ```
 
-- `260825-0845/round-01`: the orphan is created at t=189.4, terminated at t=192.3 and removed at
-  t=195.3. That **lifecycle** — created, given the credentials, then torn down — is what cost the
-  round; the round failed 1.6 s past the deadline.
-- `260825-0856/round-03`: the orphan is created at t=226.3 and is **still on air at harvest**
-  (`VAP_PRESENT=… wlan1_2@5180=<backhaul-ssid>`), with its own UCI section
-  `wireless.iface_wlan0` (`ifname='wlan1_2'`, `multi_ap='1'`).
+`backhaul.sh` sets `onboarding::agent_serviceable_uptime` on **every** `no → yes` transition, so the
+tuple now reads **233** and the true first-serviceable time (198) is gone from it. The onboarded
+tuple is latched and still reads 198 correctly, so the two disagree by 35 s on the same round.
 
-Round 03 is the one to look at, because the two verdicts disagree and both are behaving as
-designed:
+That matters because `::agent_serviceable_uptime` is the number firmware-bugs 071 is about — "when
+did this node become usable". As shipped it answers "when did it most recently become usable", which
+is a different question and, on any round with a backhaul flap, a later answer. Not a harness gap:
+it needs either a latched `_first` companion tuple or the semantics stated in the northbound
+contract. **Owed:** its own ledger entry — held back only because another session is currently
+allocating numbers in `firmware-bugs/` and 078 was taken while this was being written.
 
-- The **harness** said `pass` at 68 s. Its inventory checks that every expected VAP is present and
-  carries the right SSID; an *extra* VAP is not something it looks for (`VAP_MISSING=` empty, and
-  there is no `VAP_EXTRA` field).
-- The **node** said `agent_onboarded=no`, `detail=the Multi-AP BSSes do not yet carry the controller
-  credentials`. `_backhaul_bss_gap` ran `_backhaul_netifd_owned_iface` before any SSID test, and a
-  Multi-AP BSS on a name netifd never produced disqualified the section outright — deliberately, per
-  firmware-bugs 070: the GUI, JNAP, TR-181 and WPS are all bound to the netifd sections.
-
-**The firmware side of this is already fixed, after these rounds were run.** `b84e27d` (premium feed,
-branch `fix/076-orphan-vap-not-our-business`, unpushed) makes the verdict **skip** a section netifd
-never created rather than fail on it, and moves removal to a sweep gated on
-`::agent_serviceable=yes` — the same premise was also making the fronthaul liveness ladder rebuild
-`radio0_band1` for the orphan, which is what cost `260825-0845` its ~36 s and its bSTA drop. See
-firmware-bugs 076. So the harness is now the side that needs changing: a round carrying an orphan
-should be *reported* as such, not passed silently.
-
-The harvest is 6.5 s after the orphan appeared, so this round does **not** prove the marker would
-have stayed `no` indefinitely — the orphan fold had not run inside the round window, and the round
-ended before it could. Settling that needs a round that is left alone for a minute past the pass,
-which the harness currently does not do.
-
-`26082508`'s own recovery did work on that round: at t=224.19 the back-out trigger armed (UCI had
-the controller's fronthaul credentials while the runtime did not, agent in state 14), and at
-t=229.52 it cleared itself — "the runtime picked the controller's credentials up on its own after
-5s, no repair needed".
+The same round is also a second reminder that a passing round is not a quiet one: `wpa_supplicant
+has 0 networks` after a *successful* onboard, twice (`recovered (was disconnected ~20s)` at t=198.96
+as well), is the 064/065 class of fault recovering on its own.
 
 ## Harness state
 
-Pushed through `9373dcb`; `main` == `origin/main`. `inventory` (the exact-VAP-set check) and the
-per-round `agent-verdict.txt` readback are the newest additions.
+The live harness is **`~/bin/onboard-test.sh` + `~/bin/onboard-check.sh`**, which are **untracked and
+outside any git repo**. This directory tracks an older, different `onboard-timing-test.sh`. Every gap
+fix below was made in the live scripts, because that is where a round actually reads them from — so
+the fixes are currently unversioned, and vendoring them in here is the open decision.
 
-### Harness gaps — worth fixing before the next series
+### Harness gaps — all seven now closed, and each one proven by a round
 
-1. **No `build_version` in any artefact.** Nothing in a round directory says which firmware
-   produced it; build attribution is by flash sequence and memory only. Stamp
-   `/etc/routerinfo`'s `build_version` into `round-meta.txt` for both nodes.
-2. **No `VAP_EXTRA`.** An orphan VAP passes the inventory check silently (round 03). The check
-   should report VAPs present that are not in the expected set. **Report, do not fail:** since
-   `b84e27d` the firmware deliberately treats an orphan as none of its business, so a round that
-   carried one and still onboarded correctly *is* a pass — the field exists so the round can be
-   attributed, and so the sweep's effect can be seen.
-3. **`onboarding::agent_serviceable_uptime` is not harvested.** `agent_onboarded*` is read back, but
-   the serviceable timestamp — the number firmware-bugs 071 is about — still has to be dug out of
-   the timeline by hand.
-4. **`REPAIR_ATTEMPTS` is never written.** It is empty in all six rounds' `check-pass.txt`. Either
-   the field is not being populated or no repair has ever fired in a harvested round; both readings
-   need distinguishing, because the uplink guardian's recovery ladder is unverified on the DUT
-   precisely for this reason.
-5. **The uptime line in the timeline header can be nonsense.** `260825-0856/round-02` prints
-   `pairing triggered at t=1992324s of agent uptime` while `round-meta.txt` correctly records
-   `agent_uptime_at_trigger=101.04` — the header derives it from epochs, and the box's clock is
-   pre-NTP at that point (that round's boot epoch reads `2026-08-02`).
-6. **A round ends at the pass.** No post-pass settle window, which is what round 03 needed.
+Every claim here is verified against `260825-1049/round-01`'s artefacts, not against the diff.
+
+1. **`build_version` in every artefact** — closed. `onboard-check.sh` emits
+   `BUILD=$(sed -n 's/^build_version=//p' /etc/routerinfo)`, and `harvest()` writes `build_version`
+   into `agent-meta.txt` and `ctrl-meta.txt`. Reads `26082511` in all four rounds. `devinfo.info.
+   sw_version` is *not* a substitute: it is the marketing version (`11.7.31`) and identical across
+   builds.
+2. **`VAP_ORPHAN`** — closed (already done in the live script before this pass). A VAP whose ifname
+   does not parse as `<phy>.<radio>-<bss>` is reported and never scored, matching `fronthaul.sh`'s
+   `_fh_netifd_owned` and firmware-bugs 076. Reads empty in all four rounds — no orphan recurred, so
+   the field is verified as *silent*, not as *catching* one.
+3. **`onboarding::agent_serviceable_uptime` harvested** — closed. `_verdict_tuples()` is now a single
+   definition used by both the verdict poll and the settle window, and reads back
+   `agent_serviceable`, `agent_serviceable_uptime` and `agent_ready_uptime` alongside the
+   `agent_onboarded*` set. This is what produced the 54 s and the 35 s findings above; both were
+   invisible before.
+4. **`REPAIR_ATTEMPTS` distinguishes absent from zero** — closed. `/var/run/lsmesh-sta-iface-repair.
+   attempts` only exists once a repair has fired, so an empty field used to mean either "never fired"
+   or "this build does not write it". It now prints `none` when the file is absent, and all four
+   rounds read `none` — so lsmesh's repair ladder still has **no** DUT round exercising it (066).
+5. **The timeline's uptime header** — closed. It now prefers `agent_uptime_at_trigger` read from the
+   agent, falls back to `trigger_epoch - boot` only when that is missing, labels which one it used,
+   and prints an IMPLAUSIBLE warning plus a clock-skew NOTE instead of a number. Regenerating
+   `260825-0856/round-01` turned `t=1992058s` into
+   `t=101.08s of agent uptime (read from the agent)`.
+6. **A post-pass settle window** — closed. `SETTLE_WATCH=60` (override to `0` to skip) re-runs the
+   check and the tuple readback, re-dumps `uci show wireless`, and says so if the config changed
+   under it. Taken on failed rounds too, since that is where a late fold matters most. It is what
+   captured all four `agent_ready_uptime` values; `agent-wireless-settle.uci` was byte-identical to
+   `agent-wireless.uci` in all four rounds.
+7. **The uplink guardian's rungs were unrecorded** — closed, and this one was not on the old list.
+   `wifi_monitor`'s uplink ladder writes no counter and no tuple; its only record is one log line per
+   rung. `UPLINK_RUNGS` now reports the rung numbers in order and `UPLINK_PASSES` the full-pass
+   count. Both read empty / `0` in all four rounds, which is the expected reading on a healthy round
+   and is now a statement rather than a missing field.
+
+Also fixed on the way: `AGENT_STATE` was **silently empty in every artefact ever taken**. Its pattern
+was `grep -ao 'FSM: [A-Z_]*'` against `beerocks_agent.log`, which contains `STATE_NOTIFICATION` lines
+and never an `FSM: <STATE>` one. It now reads `wifi-monitor.log`'s own
+`the prplMesh agent is <STATE> (<n>)` and falls back to the old pattern, reporting `none-logged` when
+neither is present — an `OPERATIONAL` agent stops printing the line, and that is expected rather than
+unknown. Reads `WAIT_FOR_AUTO_CONFIGURATION_COMPLETE(14)` in all four rounds.
+
+### Remaining harness gaps
+
+1. **The scripts are not in this repo** (above). Until they are, a round's harness version is
+   unattributable in exactly the way the firmware's was before gap 1 was closed.
+2. **`check-last.txt` is easy to misread.** It is the last *failing* poll, written on every
+   non-passing poll, so a passing round still leaves a `VERDICT=fail` file next to `check-pass.txt`.
+   Nothing is wrong; the name is. Reading it as the round's verdict is a mistake this file has now
+   made once.
+3. **The pass criterion still cannot see an extra VAP.** `VAP_ORPHAN` reports one, but the round
+   verdict does not consider it, which is deliberate per 076 — recorded here so it is a decision and
+   not an oversight.
 
 ## Firmware git state
 
 | tree | state |
 |---|---|
-| feed `premium` (`store/sdk/qsdk/feeds/premium`) | `b84e27d` on **local** branch `fix/076-orphan-vap-not-our-business`, one commit ahead of `d81399d` (`origin/develop`, merged as feed_premium#10) — the 076 orphan-VAP fix, no PR yet, **not in `26082508`** |
-| feed `core` (`store/sdk/qsdk/feeds/core`) | `48ef213`, at `origin/develop` — merged as feed_core#11 |
-| targets tree | one **local-only** commit `69547d5` on `fix/065-bhsta-cred-single-instance-sdk-patch`, no PR — the `pgrep -f` single-instance guard for `prplmesh-bhsta-cred` as an `sdk_patches` entry. A fresh checkout still builds without it. |
+| feed `premium` | branch `fix/076-orphan-vap-not-our-business`, **three commits** ahead of `origin/develop` (`d81399d`) and unpushed: `b84e27d` (076, orphan sections are none of our business), `be57443` (078, hold the `ieee1905_transport` restart down before acting on it), `918ec7c` (docs). `b84e27d` and `be57443` are both **in the flashed `26082510`/`26082511` images** |
+| feed `core` | `48ef213`, at `origin/develop` — merged as feed_core#11 |
+| targets tree | one local-only commit `69547d5` on `fix/065-bhsta-cred-single-instance-sdk-patch`, no PR — the `pgrep -f` single-instance guard for `prplmesh-bhsta-cred` as an `sdk_patches` entry. A fresh checkout still builds without it |
 
 ## Not in scope
 
